@@ -11,7 +11,7 @@ use crate::islands::{self, COAST_ZONE_PX, Group, ISLAND_CONTINENTS, MARGIN_PX};
 use crate::land::{Cell, LandParams, cut};
 use crate::partition::split;
 use crate::rng::at;
-use crate::locations::{Label, read_location_map};
+use crate::locations::{Label, LocationMap, read_location_map};
 
 /// 縮小的地圖與生成範圍；以地點索引的欄位是每個地點一筆。
 pub struct Canvas {
@@ -32,6 +32,8 @@ pub struct Canvas {
     pub domain: Vec<bool>,
     /// 每個地點的上層（同 `geography::LEVELS`）。
     pub parents: Vec<Option<[String; 5]>>,
+    /// 原版的完整地點圖（第 10 步放大與檢查用）。
+    pub vanilla: LocationMap,
 }
 
 /// 讀 `map_data` 並決定生成範圍：延伸 `reach_px`、緩衝 `GUARD_PX`。
@@ -56,7 +58,21 @@ pub fn read_canvas(map_data: &Path, step: usize, reach_px: u32) -> Result<Canvas
     );
     let island_land: Vec<bool> = (0..land.len()).map(|l| land[l] && islandish[l]).collect();
     tidy(&mut labels, &mut domain, (width, height), FRAGMENT_PX.div_ceil(step * step), &island_land);
-    Ok(Canvas { width, height, step, labels, new_world, ocean, sea, land, islandish, coast_zone, domain, parents: geo.parents })
+    Ok(Canvas {
+        width,
+        height,
+        step,
+        labels,
+        new_world,
+        ocean,
+        sea,
+        land,
+        islandish,
+        coast_zone,
+        domain,
+        parents: geo.parents,
+        vanilla: map,
+    })
 }
 
 /// 生成結果：每格的類別，以及最後的標籤（搬過的島群在新位置）。

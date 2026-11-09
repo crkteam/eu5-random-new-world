@@ -290,6 +290,7 @@ mod tests {
             coast_zone: vec![false; 12],
             domain: part.iter().map(|&p| p != u32::MAX).collect(),
             parents,
+            vanilla: crate::locations::LocationMap { width: 0, height: 0, locations: Vec::new(), labels: Vec::new() },
         };
         let lake: Vec<bool> = (0..12).map(|l| l == 5).collect();
         let land: Vec<usize> = (0..12).collect();

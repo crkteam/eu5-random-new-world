@@ -13,4 +13,5 @@ pub mod noise;
 pub mod partition;
 pub mod pdx;
 pub mod rng;
+pub mod validate;
 pub mod vdf;

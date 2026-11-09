@@ -117,6 +117,8 @@ struct App {
     locations_check: Task<(String, egui::TextureHandle, egui::TextureHandle)>,
     /// 步驟 9b：原版區域、新地圖區域、放大的地區與省。
     ids_check: Task<(String, egui::TextureHandle, egui::TextureHandle, egui::TextureHandle)>,
+    /// 步驟 10：完整解析度的新地點圖（縮圖與原尺寸的一角）。
+    full_check: Task<(String, egui::TextureHandle, egui::TextureHandle)>,
     /// 產生器頁「生成」的結果；`Idle` 時中央顯示原版地圖。
     generated: Task<(String, egui::TextureHandle)>,
     /// 中央的原版地圖（步驟 4），啟動時開始讀。
@@ -146,6 +148,7 @@ impl App {
             land_check: Task::Idle,
             locations_check: Task::Idle,
             ids_check: Task::Idle,
+            full_check: Task::Idle,
             generated: Task::Idle,
             vanilla,
         }
@@ -289,6 +292,21 @@ impl App {
             ui.label("新地圖的區域");
             wide_image(ui, new);
             ui.label("放大：地區與省");
+            wide_image(ui, close);
+        });
+        ui.add_space(12.0);
+
+        ui.strong("10. 放大成完整地圖並檢查");
+        ui.weak(format!(
+            "接著 9b（{name}、種子 {}），把每 4 像素一格的結果放大成遊戲用的 16384×8192 地點圖：生成的格子整格換成新地點，原版小島照原圖逐像素搬過去，其餘保留原版。然後檢查：新分配的地點每個剛好一塊、其他地點的塊數不比原版多（原版本來就有很多多塊的島）、每個地點都還有像素、陸地／海／湖的類別都對。有任何問題就列出來並失敗。圖用每個地點在遊戲裡的顏色：第一張每 8 像素取一點，第二張是陸地中心附近的原尺寸。",
+            self.seed
+        ));
+        let (seed, reach) = (self.seed, self.reach_px);
+        self.full_check.button(ui, move |ctx| full_map(ctx, seed, key, reach));
+        self.full_check.show(ui, |ui, (summary, whole, close)| {
+            ui.label(summary);
+            wide_image(ui, whole);
+            ui.add_space(4.0);
             wide_image(ui, close);
         });
     }
@@ -687,6 +705,56 @@ fn locations_map(
     let whole = ctx.load_texture("locations", egui::ColorImage::from_rgb([w, h], &pixels), options);
     let close = ctx.load_texture("locations_close", egui::ColorImage::from_rgb([cw, ch], &close), egui::TextureOptions::NEAREST);
     Ok((summary, whole, close))
+}
+
+/// 步驟 10：放大成完整地圖並檢查；回傳說明、縮圖、陸地中心附近的原尺寸。
+fn full_map(
+    ctx: &egui::Context,
+    seed: u64,
+    key: &str,
+    reach_px: u32,
+) -> Outcome<(String, egui::TextureHandle, egui::TextureHandle)> {
+    use eu5_rnw_core::generate::{assign_ids, cut_locations, generate};
+    use eu5_rnw_core::land::{Cell, preset};
+
+    let params = preset(key).ok_or_else(|| format!("unknown world type {key}"))?;
+    let c = canvas(reach_px)?;
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let world = generate(&c, seed, &params, threads)?;
+    let found = cut_locations(&c, &world, seed)?;
+    let done = assign_ids(&c, &world, &found)?;
+    let start = Instant::now();
+    let labels = eu5_rnw_core::validate::full_map(&c, &world, &found, &done);
+    let built = start.elapsed().as_secs_f64();
+    let report = eu5_rnw_core::validate::check(&c, &done, &labels)?;
+    let checked = start.elapsed().as_secs_f64() - built;
+
+    let new = eu5_rnw_core::locations::LocationMap {
+        width: c.vanilla.width,
+        height: c.vanilla.height,
+        locations: c.vanilla.locations.clone(),
+        labels,
+    };
+    let colors: Vec<[u8; 3]> = new.locations.iter().map(|l| rgb(l.color)).collect();
+    let whole = preview(&new, 8, &colors);
+    let land: Vec<usize> = (0..done.cells.len()).filter(|&i| done.cells[i] == Cell::Land).collect();
+    let (cx, cy) = (
+        land.iter().map(|&i| i % c.width).sum::<usize>() / land.len().max(1) * c.step,
+        land.iter().map(|&i| i / c.width).sum::<usize>() / land.len().max(1) * c.step,
+    );
+    let (cw, ch) = (1024.min(new.width), 640.min(new.height));
+    let (x0, y0) = (cx.saturating_sub(cw / 2).min(new.width - cw), cy.saturating_sub(ch / 2).min(new.height - ch));
+    let close: Vec<u8> =
+        (0..ch).flat_map(|y| (0..cw).map(move |x| (y0 + y) * new.width + x0 + x)).flat_map(|i| colors[usize::from(new.labels[i])]).collect();
+    let summary = format!(
+        "種子 {seed}、{key}：檢查通過。{} 個新分配的地點每個剛好一塊；definitions.txt 的 {} 個地點都有像素；{} 個地點是多塊（都不比原版多）。放大 {built:.2} 秒、檢查 {checked:.2} 秒。",
+        report.assigned, report.placed, report.multi_piece,
+    );
+    Ok((
+        summary,
+        ctx.load_texture("full", whole, egui::TextureOptions::LINEAR),
+        ctx.load_texture("full_close", egui::ColorImage::from_rgb([cw, ch], &close), egui::TextureOptions::NEAREST),
+    ))
 }
 
 /// 名稱的固定顏色（亮度 0x50～0xe0）。

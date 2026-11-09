@@ -53,8 +53,8 @@ pub fn distance(sources: &[bool], (width, height): (usize, usize), limit: u32) -
     out
 }
 
-/// 生成範圍：新世界的格子，加上距離新世界不超過 `reach` 格、
-/// 離「其他」格子超過 `guard` 格的遠洋海域格子。
+/// 生成範圍：新世界的格子，加上遠洋的整片海域：有一格距離新世界不超過 `reach` 格，
+/// 而且每一格都離「其他」格子超過 `guard` 格。
 ///
 /// `labels` 是縮小的標籤圖；以地點索引的 `new_world`、`ocean`（在 `OCEANS` 大陸裡）、`sea`。
 /// 「其他」＝不是新世界也不在 `OCEANS` 大陸裡的地點；遠洋裡的島（百慕達等）不算其他，
@@ -71,14 +71,62 @@ pub fn new_world_domain(
     };
     let near_new = distance(&cells(&|l| new_world[l]), size, reach + 1);
     let near_other = distance(&cells(&|l| !new_world[l] && !ocean[l]), size, guard + 1);
+    // 以整個海域為單位（第 9 步要重用地點 ID，不能把一片海切成範圍內外兩半）：
+    // 有一格在延伸距離內就算近，每一格都在緩衝外才算遠。
+    let (mut near, mut far) = (vec![false; new_world.len()], vec![true; new_world.len()]);
+    for (i, &l) in labels.iter().enumerate() {
+        let l = usize::from(l);
+        near[l] |= near_new[i] <= reach;
+        far[l] &= near_other[i] > guard;
+    }
     labels
         .iter()
-        .enumerate()
-        .map(|(i, &l)| {
+        .map(|&l| {
             let l = usize::from(l);
-            new_world[l] || (ocean[l] && sea[l] && near_new[i] <= reach && near_other[i] > guard)
+            new_world[l] || (ocean[l] && sea[l] && near[l] && far[l])
         })
         .collect()
+}
+
+/// 比這個面積（原圖像素）小的範圍碎塊與範圍外小洞，是縮小取樣時參差邊界留下的。
+pub const FRAGMENT_PX: usize = 1024;
+
+/// 清掉邊界的碎塊（少於 `small` 格），讓範圍內外的地點在格子上都不會被切成孤立的小片：
+/// 太小的範圍碎塊交給旁邊範圍外最常見的地點；太小、又不含島嶼陸地的範圍外小洞併進範圍，
+/// 標籤換成旁邊範圍內最常見的地點。含島嶼陸地的洞留給 `islands::fill_holes`。
+pub fn tidy(labels: &mut [Label], domain: &mut [bool], size: (usize, usize), small: usize, island_land: &[bool]) {
+    for inside in [true, false] {
+        let mask: Vec<bool> = domain.iter().map(|&d| d == inside).collect();
+        let (part, sizes) = crate::land::components(&mask, size);
+        let mut pieces: Vec<Vec<usize>> = vec![Vec::new(); sizes.len()];
+        for (i, &p) in part.iter().enumerate() {
+            if p != u32::MAX && sizes[p as usize] < small {
+                pieces[p as usize].push(i);
+            }
+        }
+        for cells in pieces.iter().filter(|c| !c.is_empty()) {
+            if !inside && cells.iter().any(|&i| island_land[usize::from(labels[i])]) {
+                continue;
+            }
+            // 上下邊的範圍外是整個世界的外圍，不是洞。
+            if !inside && cells.iter().any(|&i| i < size.0 || i >= size.0 * (size.1 - 1)) {
+                continue;
+            }
+            let mut counts = std::collections::BTreeMap::new();
+            for &i in cells {
+                for n in crate::land::neighbours(i, size) {
+                    if domain[n] != inside {
+                        *counts.entry(labels[n]).or_insert(0usize) += 1;
+                    }
+                }
+            }
+            let Some((&label, _)) = counts.iter().max_by_key(|&(&l, &c)| (c, std::cmp::Reverse(l))) else { continue };
+            for &i in cells {
+                labels[i] = label;
+                domain[i] = !inside;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -120,15 +168,32 @@ mod tests {
 
     #[test]
     fn domain_takes_near_ocean_away_from_others() {
-        // 地點 0 = 新世界，1 = 遠洋的海，2 = 舊世界近海，3 = 遠洋裡的島。
-        let new_world = [true, false, false, false];
-        let ocean = [false, true, false, true];
-        let sea = [true, true, true, false];
-        let labels: Vec<Label> = vec![0, 1, 1, 1, 1, 1, 2, 1, 1, 1, 3, 1, 1, 1];
-        // 延伸 4 格、緩衝 1 格：舊世界近海（6）兩側各 1 格不納入，島（10）本身不納入，
-        // 島旁邊的海照樣納入；最右邊的格子經由左右相接靠近新世界。
-        let domain = new_world_domain(&labels, (14, 1), (&new_world, &ocean, &sea), 4, 1);
-        let expect = [1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 1, 1, 1];
+        // 地點 0 = 新世界，1、4、5、6 = 遠洋的海，2 = 舊世界近海，3 = 遠洋裡的島。
+        let new_world = [true, false, false, false, false, false, false];
+        let ocean = [false, true, false, true, true, true, true];
+        let sea = [true, true, true, false, true, true, true];
+        let labels: Vec<Label> = vec![0, 1, 1, 4, 4, 5, 2, 6, 6, 6, 3, 6, 6, 1];
+        // 延伸 2 格、緩衝 1 格：海 1 有格子靠近新世界（經由左右相接的最右格也算），整片納入；
+        // 海 4 太遠；海 5 和 6 各有一格貼著舊世界近海，整片不納入；島 3 本身不是海。
+        let domain = new_world_domain(&labels, (14, 1), (&new_world, &ocean, &sea), 2, 1);
+        let expect = [1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
         assert_eq!(domain, expect.map(|e| e == 1));
+    }
+
+    #[test]
+    fn tidy_removes_fragments_and_pockets() {
+        // 範圍（#）裡有一格範圍外的小洞（標籤 9），範圍外有一格孤立的範圍碎塊（標籤 5）；
+        // 標籤 8 的洞是島嶼陸地，要留著。
+        let (mut domain, size) = grid(&["......", ".###..", ".#.#.#", ".###..", ".#.#..", ".###.."]);
+        let mut labels: Vec<Label> = domain.iter().map(|&d| if d { 1 } else { 2 }).collect();
+        labels[2 * 6 + 2] = 9;
+        labels[4 * 6 + 2] = 8;
+        labels[2 * 6 + 5] = 5;
+        let island_land: Vec<bool> = (0..10).map(|l| l == 8).collect();
+        tidy(&mut labels, &mut domain, size, 2, &island_land);
+        assert!(domain[2 * 6 + 2] && labels[2 * 6 + 2] == 1, "the pocket joins the domain");
+        assert!(!domain[4 * 6 + 2] && labels[4 * 6 + 2] == 8, "an island hole stays");
+        assert!(!domain[2 * 6 + 5] && labels[2 * 6 + 5] == 2, "the fragment goes to its outside neighbour");
+        assert!(domain[6 + 1], "the main domain stays");
     }
 }

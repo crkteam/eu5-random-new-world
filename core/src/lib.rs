@@ -9,6 +9,7 @@ pub mod islands;
 pub mod land;
 pub mod locations;
 pub mod noise;
+pub mod partition;
 pub mod pdx;
 pub mod rng;
 pub mod vdf;

@@ -1,14 +1,9 @@
 [package]
-name = "eu5-rnw"
+name = "eu5-rnw-core"
 version = "0.1.0"
 edition = "2024"
-description = "A Rust rewrite of the Random New World generator for Europa Universalis V (personal build)"
+description = "The eu5-rnw generator: reads the game, generates the New World"
 license = "MPL-2.0"
 publish = false
 
-# Step 1 needs no third-party crates: it reads text files and the PNG header itself.
-
-[profile.release]
-opt-level = 3
-lto = "thin"
-codegen-units = 1
+[dependencies]

@@ -990,7 +990,12 @@ name = "eu5-rnw"
 version = "0.1.0"
 dependencies = [
  "eframe",
+ "eu5-rnw-core",
 ]
+
+[[package]]
+name = "eu5-rnw-core"
+version = "0.1.0"
 
 [[package]]
 name = "euclid"

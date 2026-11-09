@@ -26,7 +26,7 @@ struct App {
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let status = match load_cjk_font(&cc.egui_ctx) {
-            Ok(()) => "就緒".to_owned(),
+            Ok(()) => game_status(),
             Err(message) => message,
         };
         Self { preset: 0, seed: 319_218_363, status }
@@ -82,6 +82,18 @@ impl eframe::App for App {
                 ui.weak("地圖預覽（生成後顯示）");
             });
         });
+    }
+}
+
+/// 用 core 找 EU5，回報位置與 Steam build。
+fn game_status() -> String {
+    match eu5_rnw_core::game::choose_game(None) {
+        Ok(game) => format!(
+            "找到 EU5：{}（build {}）",
+            game.directory.display(),
+            game.build_id.as_deref().unwrap_or("未知")
+        ),
+        Err(error) => error.to_string(),
     }
 }
 

@@ -2,6 +2,10 @@
 # 編譯結果：target/release/eu5-rnw.exe
 [workspace]
 resolver = "3"
-members = ["ui"]
-# core 的草稿還沒有 lib.rs，等接上時再移到 members。
-exclude = ["core"]
+members = ["core", "ui"]
+
+# 生成地圖是大量數值運算，release 版開滿優化。
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

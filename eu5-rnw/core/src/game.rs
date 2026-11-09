@@ -160,6 +160,16 @@ mod tests {
         assert_eq!(library_of(Path::new("elsewhere/game")), None);
     }
 
+    /// 需要本機安裝 EU5：`cargo test -p eu5-rnw-core -- --ignored --nocapture`
+    #[test]
+    #[ignore = "needs an installed EU5"]
+    fn finds_the_installed_game() {
+        let game = choose_game(None).expect("EU5 should be installed");
+        println!("{} build {:?}", game.directory.display(), game.build_id);
+        assert!(game.map_data().join("locations.png").is_file());
+        assert!(game.build_id.is_some());
+    }
+
     #[test]
     fn build_id_from_manifest() {
         let library = std::env::temp_dir().join(format!("eu5rnw-test-{}", std::process::id()));

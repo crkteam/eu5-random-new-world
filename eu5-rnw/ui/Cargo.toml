@@ -8,3 +8,4 @@ publish = false
 
 [dependencies]
 eframe = "0.35.0"
+eu5-rnw-core = { version = "0.1.0", path = "../core" }

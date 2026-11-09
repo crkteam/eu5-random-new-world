@@ -64,10 +64,12 @@ fn registry_steam_path() -> Option<PathBuf> {
     if !cfg!(windows) {
         return None;
     }
-    let output = std::process::Command::new("reg")
-        .args(["query", r"HKCU\Software\Valve\Steam", "/v", "SteamPath"])
-        .output()
-        .ok()?;
+    let mut command = std::process::Command::new("reg");
+    command.args(["query", r"HKCU\Software\Valve\Steam", "/v", "SteamPath"]);
+    // 視窗程式沒有主控台，不加 CREATE_NO_WINDOW 的話 Windows 每次都替 reg 開一個（約 0.3–0.8 秒，還會閃黑窗）。
+    #[cfg(windows)]
+    std::os::windows::process::CommandExt::creation_flags(&mut command, 0x0800_0000);
+    let output = command.output().ok()?;
     let text = String::from_utf8_lossy(&output.stdout);
     let line = text.lines().find(|l| l.contains("SteamPath"))?;
     let value = line.split("REG_SZ").nth(1)?.trim();

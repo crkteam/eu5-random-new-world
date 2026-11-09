@@ -121,6 +121,8 @@ struct App {
     full_check: Task<(String, egui::TextureHandle, egui::TextureHandle)>,
     /// 步驟 11a：原版的高度貼花。
     relief_check: Task<(String, egui::TextureHandle)>,
+    /// 步驟 11b：新地圖的高度。
+    new_relief_check: Task<(String, egui::TextureHandle, egui::TextureHandle)>,
     /// 產生器頁「生成」的結果；`Idle` 時中央顯示原版地圖。
     generated: Task<(String, egui::TextureHandle)>,
     /// 中央的原版地圖（步驟 4），啟動時開始讀。
@@ -152,6 +154,7 @@ impl App {
             ids_check: Task::Idle,
             full_check: Task::Idle,
             relief_check: Task::Idle,
+            new_relief_check: Task::Idle,
             generated: Task::Idle,
             vanilla,
         }
@@ -322,6 +325,23 @@ impl App {
         self.relief_check.show(ui, |ui, (summary, texture)| {
             ui.label(summary);
             wide_image(ui, texture);
+        });
+        ui.add_space(12.0);
+
+        ui.strong("11b. 算新地圖的高度");
+        ui.weak(format!(
+            "接著第 10 步（{name}、種子 {}），在生成的範圍算新高度（還不寫回遊戲檔）：海照原版的海岸剖面，\
+             陸地從岸邊 5708 平滑升到內陸高度；內陸高度是每個地點在原版的平均高度，模糊後再加隨高度變大的細噪聲。\
+             範圍外與島群保留原版高度（搬過的島群連高度一起搬）。顏色同 11a；第二張是陸地中心附近、每個地點像素一點。",
+            self.seed
+        ));
+        let (seed, reach) = (self.seed, self.reach_px);
+        self.new_relief_check.button(ui, move |ctx| new_relief_map(ctx, seed, key, reach));
+        self.new_relief_check.show(ui, |ui, (summary, whole, close)| {
+            ui.label(summary);
+            wide_image(ui, whole);
+            ui.add_space(4.0);
+            wide_image(ui, close);
         });
     }
 
@@ -774,6 +794,96 @@ fn full_map(
 /// 高於這個值算陸地（原專案量到海底約 2234、陸地約 5500 以上）。
 const LAND_HEIGHT: u16 = 4000;
 
+/// 高度的顏色：低於 `LAND_HEIGHT` 是深淺不同的藍；4000→綠、12000→黃、20000→褐、30000 以上→白。
+fn height_color(v: u16) -> [u8; 3] {
+    if v <= LAND_HEIGHT {
+        let t = u32::from(v) * 255 / u32::from(LAND_HEIGHT);
+        return rgb((0x10 + t / 6) << 16 | (0x30 + t / 4) << 8 | (0x60 + t / 3));
+    }
+    let stops = [
+        (4000.0, [70.0, 140.0, 60.0]),
+        (12000.0, [210.0, 200.0, 90.0]),
+        (20000.0, [140.0, 95.0, 60.0]),
+        (30000.0, [245.0, 245.0, 245.0]),
+    ];
+    let v = f64::from(v).min(30000.0);
+    let k = stops.windows(2).position(|s| v <= s[1].0).unwrap_or(2);
+    let (a, b) = (stops[k], stops[k + 1]);
+    let t = (v - a.0) / (b.0 - a.0);
+    [0, 1, 2].map(|c| (a.1[c] + (b.1[c] - a.1[c]) * t) as u8)
+}
+
+/// 步驟 11b：新地圖的高度；回傳說明、整張縮圖（每 8 地點像素）、陸地中心附近（每地點像素一點）。
+fn new_relief_map(
+    ctx: &egui::Context,
+    seed: u64,
+    key: &str,
+    reach_px: u32,
+) -> Outcome<(String, egui::TextureHandle, egui::TextureHandle)> {
+    use eu5_rnw_core::generate::{assign_ids, cut_locations, generate};
+    use eu5_rnw_core::land::{Cell, preset};
+    use eu5_rnw_core::relief::{Relief, source_cell};
+
+    let params = preset(key).ok_or_else(|| format!("unknown world type {key}"))?;
+    let game = eu5_rnw_core::game::choose_game(None).map_err(|e| e.to_string())?;
+    let c = canvas(reach_px)?;
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let world = generate(&c, seed, &params, threads)?;
+    let found = cut_locations(&c, &world, seed)?;
+    let done = assign_ids(&c, &world, &found)?;
+    let labels = eu5_rnw_core::validate::full_map(&c, &world, &found, &done);
+    let (vw, vh, vanilla) =
+        eu5_rnw_core::terrain::sample_heights(&game.directory, STEP, threads).map_err(|e| e.to_string())?;
+    if (vw, vh) != (c.width, c.height) {
+        return Err(format!("heights {vw}x{vh} and the canvas {}x{} do not line up", c.width, c.height));
+    }
+    let start = Instant::now();
+    let relief = Relief::new(&c, &done, &labels, &vanilla, seed);
+    let seconds = start.elapsed().as_secs_f64();
+    let source = source_cell(&world, (c.width, c.height));
+    // 地點像素 (x, y) 的高度：生成的照新模型，其餘取原版（搬過的島群取來源格）。
+    let height = |x: usize, y: usize| -> u16 {
+        if relief.generated(x, y) {
+            return relief.height_at(2 * x, 2 * y).round() as u16;
+        }
+        let cell = (y / STEP) * c.width + x / STEP;
+        vanilla[source[cell].unwrap_or(cell)]
+    };
+    let (w, h) = (relief.width / 8, relief.height / 8);
+    let whole: Vec<u8> =
+        (0..h).flat_map(|y| (0..w).map(move |x| (x, y))).flat_map(|(x, y)| height_color(height(x * 8, y * 8))).collect();
+
+    let land: Vec<usize> = (0..done.cells.len()).filter(|&i| done.cells[i] == Cell::Land).collect();
+    let (cx, cy) = (
+        land.iter().map(|&i| i % c.width).sum::<usize>() / land.len().max(1) * STEP,
+        land.iter().map(|&i| i / c.width).sum::<usize>() / land.len().max(1) * STEP,
+    );
+    let (cw, ch) = (1024.min(relief.width), 640.min(relief.height));
+    let (x0, y0) = (cx.saturating_sub(cw / 2).min(relief.width - cw), cy.saturating_sub(ch / 2).min(relief.height - ch));
+    let close: Vec<u8> =
+        (0..ch).flat_map(|y| (0..cw).map(move |x| (x0 + x, y0 + y))).flat_map(|(x, y)| height_color(height(x, y))).collect();
+    let mut generated_land: Vec<u16> = (0..h * w)
+        .map(|i| (i % w * 8, i / w * 8))
+        .filter(|&(x, y)| relief.generated(x, y) && relief.coast[y * relief.width + x] < 128)
+        .map(|(x, y)| height(x, y))
+        .collect();
+    generated_land.sort_unstable();
+    let pick = |q: usize| generated_land.get(generated_land.len() * q / 100).copied().unwrap_or(0);
+    let summary = format!(
+        "種子 {seed}、{key}：新陸地高度 中位數 {}（10%～90%：{}～{}，最高 {}）。\
+         海岸剖面照原版：岸邊 5708、離岸 8 個貼花像素降到海底 2234。建高度模型 {seconds:.2} 秒。",
+        pick(50),
+        pick(10),
+        pick(90),
+        generated_land.last().copied().unwrap_or(0),
+    );
+    Ok((
+        summary,
+        ctx.load_texture("new_relief", egui::ColorImage::from_rgb([w, h], &whole), egui::TextureOptions::LINEAR),
+        ctx.load_texture("new_relief_close", egui::ColorImage::from_rgb([cw, ch], &close), egui::TextureOptions::NEAREST),
+    ))
+}
+
 /// 步驟 11a：全世界的高度縮圖，並和原版地點的陸地／海比對。
 fn relief_map(ctx: &egui::Context) -> Outcome<(String, egui::TextureHandle)> {
     use eu5_rnw_core::geography::Kind;
@@ -801,22 +911,7 @@ fn relief_map(ctx: &egui::Context) -> Outcome<(String, egui::TextureHandle)> {
         v.sort_unstable();
         v.get(v.len() / 2).copied().unwrap_or(0)
     };
-    let pixels: Vec<u8> = heights
-        .iter()
-        .flat_map(|&v| {
-            if v <= LAND_HEIGHT {
-                let t = u32::from(v) * 255 / u32::from(LAND_HEIGHT);
-                return rgb((0x10 + t / 6) << 16 | (0x30 + t / 4) << 8 | (0x60 + t / 3));
-            }
-            // 4000→綠、12000→黃、20000→褐、30000 以上→白。
-            let stops = [(4000.0, [70.0, 140.0, 60.0]), (12000.0, [210.0, 200.0, 90.0]), (20000.0, [140.0, 95.0, 60.0]), (30000.0, [245.0, 245.0, 245.0])];
-            let v = f64::from(v).min(30000.0);
-            let k = stops.windows(2).position(|s| v <= s[1].0).unwrap_or(2);
-            let (a, b) = (stops[k], stops[k + 1]);
-            let t = (v - a.0) / (b.0 - a.0);
-            [0, 1, 2].map(|c| (a.1[c] + (b.1[c] - a.1[c]) * t) as u8)
-        })
-        .collect();
+    let pixels: Vec<u8> = heights.iter().flat_map(|&v| height_color(v)).collect();
     let summary = format!(
         "{w}×{h}（每 8 個地點像素一點）。解開 16 塊貼花 {seconds:.2} 秒。海的中位數 {}、陸地 {}。高度和原版陸地／海一致的比例：全世界 {:.1}%、新世界 {:.1}%。",
         median(&|l| geo.kind[l] == Kind::Sea),

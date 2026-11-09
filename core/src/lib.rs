@@ -13,6 +13,7 @@ pub mod lzav;
 pub mod noise;
 pub mod partition;
 pub mod pdx;
+pub mod relief;
 pub mod rng;
 pub mod terrain;
 pub mod validate;

@@ -202,12 +202,21 @@ impl Geography {
 
     /// 每個地點是否屬於新世界；沒有 `america` 大陸就失敗。
     pub fn new_world(&self) -> std::result::Result<Vec<bool>, String> {
-        let america = self
-            .continents
-            .iter()
-            .position(|c| c == NEW_WORLD)
-            .ok_or_else(|| format!("{DEFINITIONS} has no continent {NEW_WORLD}"))?;
-        Ok(self.continent.iter().map(|&c| c == Some(america)).collect())
+        self.on_continents(&[NEW_WORLD])
+    }
+
+    /// 每個地點是否屬於這些大陸之一；任何一個大陸不存在就失敗。
+    pub fn on_continents(&self, names: &[&str]) -> std::result::Result<Vec<bool>, String> {
+        let mut wanted = vec![false; self.continents.len()];
+        for name in names {
+            let at = self
+                .continents
+                .iter()
+                .position(|c| c == name)
+                .ok_or_else(|| format!("{DEFINITIONS} has no continent {name}"))?;
+            wanted[at] = true;
+        }
+        Ok(self.continent.iter().map(|c| c.is_some_and(|c| wanted[c])).collect())
     }
 
     /// 不在 `definitions.txt` 的地點必須沒有像素（原版有 9 個這種沒用到的顏色）；
@@ -334,6 +343,14 @@ ocean = { north_sea = { sea_region = { sea_area = { sea_province = { atlantic } 
             geo.kind,
             [Kind::Land, Kind::Land, Kind::Land, Kind::Lake, Kind::Sea]
         );
+        assert_eq!(
+            geo.on_continents(&["europe", "ocean"]).unwrap(),
+            [true, true, false, false, true]
+        );
+        assert_eq!(
+            geo.on_continents(&["atlantis"]).unwrap_err(),
+            "definitions.txt has no continent atlantis"
+        );
 
         let extra = colors(&[
             "stockholm",
@@ -384,6 +401,13 @@ ocean = { north_sea = { sea_region = { sea_area = { sea_province = { atlantic } 
             count(Kind::Impassable),
             count(Kind::NonOwnable),
             count(Kind::Sea),
+        );
+        let oceans = geo.on_continents(&crate::domain::OCEANS).unwrap();
+        let islands = (0..oceans.len()).filter(|&i| oceans[i] && geo.kind[i] != Kind::Sea).count();
+        println!(
+            "{} locations in {:?}, {islands} of them not sea",
+            oceans.iter().filter(|&&o| o).count(),
+            crate::domain::OCEANS
         );
     }
 }

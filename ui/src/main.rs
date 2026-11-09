@@ -109,6 +109,9 @@ struct App {
     geography_check: Task<String>,
     rng_check: Task<String>,
     height_check: Task<(String, egui::TextureHandle)>,
+    /// 步驟 7a：遠洋延伸距離（原圖像素）與範圍圖。
+    reach_px: u32,
+    domain_check: Task<(String, egui::TextureHandle)>,
     /// 中央的原版地圖（步驟 4），啟動時開始讀。
     vanilla: Task<(String, egui::TextureHandle)>,
 }
@@ -131,6 +134,8 @@ impl App {
             geography_check: Task::Idle,
             rng_check: Task::Idle,
             height_check: Task::Idle,
+            reach_px: eu5_rnw_core::domain::REACH_PX,
+            domain_check: Task::Idle,
             vanilla,
         }
     }
@@ -197,6 +202,28 @@ impl App {
         let seed = self.seed;
         self.height_check.button(ui, move |ctx| height_map(ctx, seed));
         self.height_check.show(ui, |ui, (summary, texture)| {
+            ui.label(summary);
+            wide_image(ui, texture);
+        });
+        ui.add_space(12.0);
+
+        ui.strong("7a. 新世界的生成範圍");
+        ui.weak(
+            "照原專案的基本模式：原版新世界（綠），加上大西洋、太平洋裡距離它不超過「延伸距離」、\
+             又離其他一切（舊世界陸地與近海、大洋洲、印度洋、南冰洋等）超過 96 像素緩衝的海域（亮藍）。",
+        );
+        ui.horizontal(|ui| {
+            ui.label("延伸距離（原圖像素，原專案預設 1600）");
+            ui.add(egui::Slider::new(&mut self.reach_px, 0..=4096).step_by(100.0));
+        });
+        let reach = self.reach_px;
+        self.domain_check.button(ui, move |ctx| domain_map(ctx, reach));
+        self.domain_check.show(ui, |ui, (summary, texture)| {
+            ui.horizontal_wrapped(|ui| {
+                for (color, name) in DOMAIN_LEGEND {
+                    swatch(ui, color, name);
+                }
+            });
             ui.label(summary);
             wide_image(ui, texture);
         });
@@ -396,15 +423,89 @@ fn show_map(
 ) {
     ui.horizontal_wrapped(|ui| {
         for (.., color, name) in LEGEND {
-            let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
-            let [r, g, b] = rgb(color);
-            ui.painter().rect_filled(rect, 2.0, egui::Color32::from_rgb(r, g, b));
-            ui.label(name);
-            ui.add_space(8.0);
+            swatch(ui, color, name);
         }
     });
     ui.label(summary);
     image(ui, texture);
+}
+
+/// 圖例的一格：色塊加說明。
+fn swatch(ui: &mut egui::Ui, color: u32, name: &str) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+    let [r, g, b] = rgb(color);
+    ui.painter().rect_filled(rect, 2.0, egui::Color32::from_rgb(r, g, b));
+    ui.label(name);
+    ui.add_space(8.0);
+}
+
+/// 步驟 7a 的圖例。
+const DOMAIN_LEGEND: [(u32, &str); 5] = [
+    (0x6dbb4f, "原版新世界"),
+    (0x3a9ad9, "納入的遠洋"),
+    (0x1e3550, "沒納入的大西洋、太平洋"),
+    (0x2a4055, "其他海域"),
+    (0x9a9586, "其他陸地、湖、荒地"),
+];
+
+/// 步驟 7a：生成範圍＝新世界＋延伸距離內、緩衝外的大西洋與太平洋，每 4 像素一格。
+fn domain_map(ctx: &egui::Context, reach_px: u32) -> Outcome<(String, egui::TextureHandle)> {
+    use eu5_rnw_core::domain::{GUARD_PX, OCEANS, new_world_domain};
+
+    const STEP: usize = 4;
+    let map_data = eu5_rnw_core::game::choose_game(None).map_err(|e| e.to_string())?.map_data();
+    let map = read_location_map(&map_data).map_err(|e| e.to_string())?;
+    let geo = read_geography(&map_data, &map.locations).map_err(|e| e.to_string())?;
+    geo.unplaced(&map.locations, &map.pixel_counts())?;
+    let new_world = geo.new_world()?;
+    let ocean = geo.on_continents(&OCEANS)?;
+    let sea: Vec<bool> = geo.kind.iter().map(|&k| k == Kind::Sea).collect();
+    let (w, h, labels) = map.downsample(STEP);
+    let start = Instant::now();
+    let domain = new_world_domain(
+        &labels,
+        (w, h),
+        (&new_world, &ocean, &sea),
+        reach_px / STEP as u32,
+        GUARD_PX / STEP as u32,
+    );
+    let seconds = start.elapsed().as_secs_f64();
+
+    let (mut original, mut added) = (0usize, 0usize);
+    let pixels: Vec<u8> = labels
+        .iter()
+        .zip(&domain)
+        .flat_map(|(&label, &inside)| {
+            let l = usize::from(label);
+            let color = if new_world[l] {
+                original += 1;
+                DOMAIN_LEGEND[0].0
+            } else if inside {
+                added += 1;
+                DOMAIN_LEGEND[1].0
+            } else if ocean[l] && sea[l] {
+                DOMAIN_LEGEND[2].0
+            } else if sea[l] {
+                DOMAIN_LEGEND[3].0
+            } else {
+                DOMAIN_LEGEND[4].0
+            };
+            rgb(color)
+        })
+        .collect();
+    let summary = format!(
+        "延伸 {reach_px} 像素、緩衝 {GUARD_PX} 像素：原版新世界 {original} 格，加上遠洋 {added} 格，範圍共 {} 格\
+         （原版的 {:.1} 倍，佔整張地圖 {:.1}%）；算範圍 {seconds:.2} 秒。",
+        original + added,
+        (original + added) as f64 / original.max(1) as f64,
+        (original + added) as f64 * 100.0 / (w * h) as f64,
+    );
+    let options = egui::TextureOptions {
+        mipmap_mode: Some(egui::TextureFilter::Linear),
+        ..egui::TextureOptions::LINEAR
+    };
+    let image = egui::ColorImage::from_rgb([w, h], &pixels);
+    Ok((summary, ctx.load_texture("domain", image, options)))
 }
 
 /// 縮到剩下的寬和高都放得下（不能捲動的區域用）。

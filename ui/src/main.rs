@@ -23,9 +23,10 @@ struct App {
     status: String,
     /// 顯示「步驟測試」頁而不是產生器。
     show_steps: bool,
-    /// 步驟 2、3 最近一次按下的結果。
+    /// 各步驟最近一次按下的結果。
     game_check: Option<String>,
     map_check: Option<Result<(String, egui::TextureHandle), String>>,
+    geography_check: Option<Result<String, String>>,
 }
 
 impl App {
@@ -41,6 +42,7 @@ impl App {
             show_steps: false,
             game_check: None,
             map_check: None,
+            geography_check: None,
         }
     }
 
@@ -50,11 +52,11 @@ impl App {
         ui.weak("每一步完成後會在這裡多一個按鈕。");
         ui.add_space(12.0);
 
-        ui.strong("1. 視窗與中文字型");
-        ui.label("看得到這行中文就是成功。");
+        ui.label("（看得到這頁的中文，就表示字型載入成功。）");
         ui.add_space(12.0);
 
-        ui.strong("2. 找到 EU5");
+        ui.strong("1. core 接進 workspace：找到 EU5");
+        ui.weak("用 Steam 設定找出遊戲資料夾與 build 編號。");
         if ui.button("執行").clicked() {
             self.game_check = Some(game_status());
         }
@@ -63,7 +65,7 @@ impl App {
         }
         ui.add_space(12.0);
 
-        ui.strong("3. 讀取 locations.png");
+        ui.strong("2. 讀取 locations.png");
         ui.weak("讀整張 16384×8192 地點圖；預覽每 16 像素取一點，用各地點自己的顏色。");
         if ui.button("執行").clicked() {
             // shortcut: 在畫面執行緒上讀（release 約 0.5 秒會凍住視窗），之後步驟變慢再改背景執行緒
@@ -73,6 +75,22 @@ impl App {
             Some(Ok((summary, texture))) => {
                 ui.label(summary);
                 ui.add(egui::Image::new(texture).shrink_to_fit());
+            }
+            Some(Err(message)) => {
+                ui.colored_label(ui.visuals().error_fg_color, message);
+            }
+            None => {}
+        }
+        ui.add_space(12.0);
+
+        ui.strong("3. 找出新世界的地點");
+        ui.weak("讀 definitions.txt 的階層與 default.map 的類別，數出大陸 america 底下的地點。");
+        if ui.button("執行").clicked() {
+            self.geography_check = Some(check_geography());
+        }
+        match &self.geography_check {
+            Some(Ok(summary)) => {
+                ui.label(summary);
             }
             Some(Err(message)) => {
                 ui.colored_label(ui.visuals().error_fg_color, message);
@@ -190,6 +208,31 @@ fn check_locations(ctx: &egui::Context) -> Result<(String, egui::TextureHandle),
     }
     let image = egui::ColorImage::from_rgb([w, h], &rgb);
     Ok((summary, ctx.load_texture("locations", image, egui::TextureOptions::NEAREST)))
+}
+
+/// 步驟 3：每個地點的大陸與類別，數出新世界。
+fn check_geography() -> Result<String, String> {
+    use eu5_rnw_core::geography::{Kind, read_geography};
+
+    let map_data = eu5_rnw_core::game::choose_game(None).map_err(|e| e.to_string())?.map_data();
+    let map = eu5_rnw_core::locations::read_location_map(&map_data).map_err(|e| e.to_string())?;
+    let geo = read_geography(&map_data, &map.locations).map_err(|e| e.to_string())?;
+    let unplaced = geo.unplaced(&map.locations, &map.pixel_counts())?;
+    let new_world = geo.new_world()?;
+    let count = |kind| (0..new_world.len()).filter(|&i| new_world[i] && geo.kind[i] == kind).count();
+    Ok(format!(
+        "{} 個大陸。新世界 {} 個地點（全部 {}）：陸地 {}、湖 {}、無法通行 {}、無主地 {}、海 {}。\n\
+         另有 {} 個顏色表裡的地點不在 definitions.txt，地圖上也沒有像素。",
+        geo.continents.len(),
+        new_world.iter().filter(|&&n| n).count(),
+        map.locations.len(),
+        count(Kind::Land),
+        count(Kind::Lake),
+        count(Kind::Impassable),
+        count(Kind::NonOwnable),
+        count(Kind::Sea),
+        unplaced.len(),
+    ))
 }
 
 /// egui 內建字型沒有中文字，從 Windows 載入微軟正黑體。

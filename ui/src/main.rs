@@ -1,11 +1,17 @@
 //! eu5-rnw 的視窗（egui）。
 //!
 //! 版型：上方標題列、左側設定面板、中央地圖區、下方狀態列。
-//! 目前只有畫面骨架；「生成」之後會呼叫 `core/` 的產生器。
+//! 中央先顯示原版地圖（新世界另外上色）；「生成」之後會呼叫 `core/` 的產生器。
+//! 讀檔等慢的工作都在背景執行緒做，視窗不會卡住。
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
+
 use eframe::egui;
+use eu5_rnw_core::geography::{Kind, read_geography};
+use eu5_rnw_core::locations::read_location_map;
 
 /// 原專案的世界類型（之後由 core 提供）。
 const PRESETS: [(&str, &str); 6] = [
@@ -17,39 +23,118 @@ const PRESETS: [(&str, &str); 6] = [
     ("wall", "高牆"),
 ];
 
+type Outcome<T> = Result<T, String>;
+
+/// 一件在背景執行緒做的工作，與它的結果和總耗時。
+enum Task<T> {
+    Idle,
+    Running(mpsc::Receiver<(Outcome<T>, Duration)>),
+    Done(Outcome<T>, Duration),
+}
+
+impl<T: Send + 'static> Task<T> {
+    fn start(
+        &mut self,
+        ctx: &egui::Context,
+        work: impl FnOnce(&egui::Context) -> Outcome<T> + Send + 'static,
+    ) {
+        let (sender, receiver) = mpsc::channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let start = Instant::now();
+            let outcome = work(&ctx);
+            // 收不到代表視窗已關閉，結果不需要了。
+            let _ = sender.send((outcome, start.elapsed()));
+            ctx.request_repaint();
+        });
+        *self = Task::Running(receiver);
+    }
+
+    fn poll(&mut self) {
+        if let Task::Running(receiver) = self {
+            match receiver.try_recv() {
+                Ok((outcome, took)) => *self = Task::Done(outcome, took),
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    *self = Task::Done(Err("背景工作意外中止（程式錯誤）".into()), Duration::ZERO);
+                }
+            }
+        }
+    }
+
+    /// 畫出狀態：執行中、錯誤（紅字）或交給 `done` 畫結果，後面附總耗時。
+    fn show(&mut self, ui: &mut egui::Ui, done: impl FnOnce(&mut egui::Ui, &T)) {
+        self.poll();
+        match self {
+            Task::Idle => {}
+            Task::Running(_) => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("執行中…");
+                });
+            }
+            Task::Done(outcome, took) => {
+                match outcome {
+                    Ok(value) => done(ui, value),
+                    Err(message) => {
+                        ui.colored_label(ui.visuals().error_fg_color, message.as_str());
+                    }
+                }
+                ui.weak(format!("總耗時 {:.2} 秒", took.as_secs_f64()));
+            }
+        }
+    }
+
+    /// 「執行」按鈕；執行中不能再按。
+    fn button(
+        &mut self,
+        ui: &mut egui::Ui,
+        work: impl FnOnce(&egui::Context) -> Outcome<T> + Send + 'static,
+    ) {
+        let running = matches!(self, Task::Running(_));
+        if ui.add_enabled(!running, egui::Button::new("執行")).clicked() {
+            self.start(ui.ctx(), work);
+        }
+    }
+}
+
 struct App {
     preset: usize,
     seed: u64,
     status: String,
     /// 顯示「步驟測試」頁而不是產生器。
     show_steps: bool,
-    /// 各步驟最近一次按下的結果。
-    game_check: Option<String>,
-    map_check: Option<Result<(String, egui::TextureHandle), String>>,
-    geography_check: Option<Result<String, String>>,
+    game_check: Task<String>,
+    map_check: Task<(String, egui::TextureHandle)>,
+    geography_check: Task<String>,
+    /// 中央的原版地圖（步驟 4），啟動時開始讀。
+    vanilla: Task<(String, egui::TextureHandle)>,
 }
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let status = match load_cjk_font(&cc.egui_ctx) {
-            Ok(()) => game_status(),
+            Ok(()) => game_status().unwrap_or_else(|message| message),
             Err(message) => message,
         };
+        let mut vanilla = Task::Idle;
+        vanilla.start(&cc.egui_ctx, vanilla_map);
         Self {
             preset: 0,
             seed: 319_218_363,
             status,
             show_steps: false,
-            game_check: None,
-            map_check: None,
-            geography_check: None,
+            game_check: Task::Idle,
+            map_check: Task::Idle,
+            geography_check: Task::Idle,
+            vanilla,
         }
     }
 
     /// 每個已完成的步驟一個按鈕，讓擁有者自己看結果。
     fn steps(&mut self, ui: &mut egui::Ui) {
         ui.heading("步驟測試");
-        ui.weak("每一步完成後會在這裡多一個按鈕。");
+        ui.weak("每一步完成後會在這裡多一個按鈕。工作在背景執行，視窗不會卡住。");
         ui.add_space(12.0);
 
         ui.label("（看得到這頁的中文，就表示字型載入成功。）");
@@ -57,46 +142,33 @@ impl App {
 
         ui.strong("1. core 接進 workspace：找到 EU5");
         ui.weak("用 Steam 設定找出遊戲資料夾與 build 編號。");
-        if ui.button("執行").clicked() {
-            self.game_check = Some(game_status());
-        }
-        if let Some(result) = &self.game_check {
-            ui.label(result);
-        }
+        self.game_check.button(ui, |_| game_status());
+        self.game_check.show(ui, |ui, text| {
+            ui.label(text);
+        });
         ui.add_space(12.0);
 
         ui.strong("2. 讀取 locations.png");
         ui.weak("讀整張 16384×8192 地點圖；預覽每 16 像素取一點，用各地點自己的顏色。");
-        if ui.button("執行").clicked() {
-            // shortcut: 在畫面執行緒上讀（release 約 0.5 秒會凍住視窗），之後步驟變慢再改背景執行緒
-            self.map_check = Some(check_locations(ui.ctx()));
-        }
-        match &self.map_check {
-            Some(Ok((summary, texture))) => {
-                ui.label(summary);
-                ui.add(egui::Image::new(texture).shrink_to_fit());
-            }
-            Some(Err(message)) => {
-                ui.colored_label(ui.visuals().error_fg_color, message);
-            }
-            None => {}
-        }
+        self.map_check.button(ui, check_locations);
+        self.map_check.show(ui, |ui, (summary, texture)| {
+            ui.label(summary);
+            ui.add(egui::Image::new(texture).shrink_to_fit());
+        });
         ui.add_space(12.0);
 
         ui.strong("3. 找出新世界的地點");
         ui.weak("讀 definitions.txt 的階層與 default.map 的類別，數出大陸 america 底下的地點。");
-        if ui.button("執行").clicked() {
-            self.geography_check = Some(check_geography());
-        }
-        match &self.geography_check {
-            Some(Ok(summary)) => {
-                ui.label(summary);
-            }
-            Some(Err(message)) => {
-                ui.colored_label(ui.visuals().error_fg_color, message);
-            }
-            None => {}
-        }
+        self.geography_check.button(ui, |_| check_geography());
+        self.geography_check.show(ui, |ui, text| {
+            ui.label(text);
+        });
+        ui.add_space(12.0);
+
+        ui.strong("4. 在視窗中央顯示原版地圖");
+        ui.weak("視窗啟動時就在背景讀取；結果在「產生器」頁中央，這裡也顯示一份。按「執行」重新讀。");
+        self.vanilla.button(ui, vanilla_map);
+        self.vanilla.show(ui, show_map);
     }
 
     fn settings(&mut self, ui: &mut egui::Ui) {
@@ -154,31 +226,26 @@ impl eframe::App for App {
             .exact_size(240.0)
             .show(ui, |ui| self.settings(ui));
         egui::CentralPanel::default_margins().show(ui, |ui| {
-            ui.centered_and_justified(|ui| {
-                ui.weak("地圖預覽（生成後顯示）");
-            });
+            ui.weak("原版地圖（生成後會換成新地圖）");
+            self.vanilla.show(ui, show_map);
         });
     }
 }
 
 /// 用 core 找 EU5，回報位置與 Steam build。
-fn game_status() -> String {
-    match eu5_rnw_core::game::choose_game(None) {
-        Ok(game) => format!(
-            "找到 EU5：{}（build {}）",
-            game.directory.display(),
-            game.build_id.as_deref().unwrap_or("未知")
-        ),
-        Err(error) => error.to_string(),
-    }
+fn game_status() -> Outcome<String> {
+    let game = eu5_rnw_core::game::choose_game(None).map_err(|e| e.to_string())?;
+    Ok(format!(
+        "找到 EU5：{}（build {}）",
+        game.directory.display(),
+        game.build_id.as_deref().unwrap_or("未知")
+    ))
 }
 
-/// 步驟 3：讀地點圖，回報統計並做一張縮小預覽。
-fn check_locations(ctx: &egui::Context) -> Result<(String, egui::TextureHandle), String> {
-    use eu5_rnw_core::locations::read_location_map;
-
+/// 步驟 2：讀地點圖，回報統計並做一張縮小預覽。
+fn check_locations(ctx: &egui::Context) -> Outcome<(String, egui::TextureHandle)> {
     let game = eu5_rnw_core::game::choose_game(None).map_err(|e| e.to_string())?;
-    let start = std::time::Instant::now();
+    let start = Instant::now();
     let map = read_location_map(&game.map_data()).map_err(|e| e.to_string())?;
     let seconds = start.elapsed().as_secs_f64();
 
@@ -190,32 +257,22 @@ fn check_locations(ctx: &egui::Context) -> Result<(String, egui::TextureHandle),
         .max_by_key(|(_, c)| **c)
         .ok_or("顏色表沒有任何地點")?;
     let summary = format!(
-        "{}×{} 像素，{} 個地點（{unused} 個沒有像素），最大的是 {}（{pixels} 像素），耗時 {seconds:.2} 秒",
+        "{}×{} 像素，{} 個地點（{unused} 個沒有像素），最大的是 {}（{pixels} 像素），讀圖 {seconds:.2} 秒",
         map.width,
         map.height,
         map.locations.len(),
         map.locations[largest].key,
     );
 
-    const STEP: usize = 16;
-    let (w, h) = (map.width / STEP, map.height / STEP);
-    let mut rgb = Vec::with_capacity(w * h * 3);
-    for y in 0..h {
-        for x in 0..w {
-            let color = map.locations[usize::from(map.label(x * STEP, y * STEP))].color;
-            rgb.extend_from_slice(&color.to_be_bytes()[1..]);
-        }
-    }
-    let image = egui::ColorImage::from_rgb([w, h], &rgb);
-    Ok((summary, ctx.load_texture("locations", image, egui::TextureOptions::NEAREST)))
+    let colors: Vec<[u8; 3]> = map.locations.iter().map(|l| rgb(l.color)).collect();
+    let texture = ctx.load_texture("locations", preview(&map, 16, &colors), egui::TextureOptions::NEAREST);
+    Ok((summary, texture))
 }
 
 /// 步驟 3：每個地點的大陸與類別，數出新世界。
-fn check_geography() -> Result<String, String> {
-    use eu5_rnw_core::geography::{Kind, read_geography};
-
+fn check_geography() -> Outcome<String> {
     let map_data = eu5_rnw_core::game::choose_game(None).map_err(|e| e.to_string())?.map_data();
-    let map = eu5_rnw_core::locations::read_location_map(&map_data).map_err(|e| e.to_string())?;
+    let map = read_location_map(&map_data).map_err(|e| e.to_string())?;
     let geo = read_geography(&map_data, &map.locations).map_err(|e| e.to_string())?;
     let unplaced = geo.unplaced(&map.locations, &map.pixel_counts())?;
     let new_world = geo.new_world()?;
@@ -233,6 +290,83 @@ fn check_geography() -> Result<String, String> {
         count(Kind::Sea),
         unplaced.len(),
     ))
+}
+
+/// 地圖圖例：（是否新世界, 類別, 顏色, 說明）。無主地與無法通行用同一色。
+const LEGEND: [(bool, &[Kind], u32, &str); 8] = [
+    (false, &[Kind::Land], 0x9a9586, "舊世界陸地"),
+    (false, &[Kind::Impassable, Kind::NonOwnable], 0x5e5a50, "舊世界荒地"),
+    (false, &[Kind::Lake], 0x5a86ad, "舊世界湖"),
+    (false, &[Kind::Sea], 0x1e3550, "舊世界海"),
+    (true, &[Kind::Land], 0x6dbb4f, "新世界陸地"),
+    (true, &[Kind::Impassable, Kind::NonOwnable], 0x3f6e32, "新世界荒地"),
+    (true, &[Kind::Lake], 0x7fc4e8, "新世界湖"),
+    (true, &[Kind::Sea], 0x2f6f9f, "新世界海"),
+];
+
+/// 步驟 4：原版地圖，每 4 像素取一點（4096×2048），依新世界與類別上色。
+fn vanilla_map(ctx: &egui::Context) -> Outcome<(String, egui::TextureHandle)> {
+    let map_data = eu5_rnw_core::game::choose_game(None).map_err(|e| e.to_string())?.map_data();
+    let map = read_location_map(&map_data).map_err(|e| e.to_string())?;
+    let geo = read_geography(&map_data, &map.locations).map_err(|e| e.to_string())?;
+    geo.unplaced(&map.locations, &map.pixel_counts())?;
+    let new_world = geo.new_world()?;
+    let colors: Vec<[u8; 3]> = (0..map.locations.len())
+        .map(|i| {
+            let (.., color, _) = LEGEND
+                .iter()
+                .find(|(nw, kinds, ..)| *nw == new_world[i] && kinds.contains(&geo.kind[i]))
+                .expect("LEGEND covers every kind for both worlds");
+            rgb(*color)
+        })
+        .collect();
+    let summary = format!(
+        "{}×{} 像素的原版地圖，縮成 1/4 顯示；新世界 {} 個地點。",
+        map.width,
+        map.height,
+        new_world.iter().filter(|&&n| n).count()
+    );
+    let options = egui::TextureOptions {
+        mipmap_mode: Some(egui::TextureFilter::Linear),
+        ..egui::TextureOptions::LINEAR
+    };
+    Ok((summary, ctx.load_texture("vanilla", preview(&map, 4, &colors), options)))
+}
+
+/// 畫地圖、圖例與說明。
+fn show_map(ui: &mut egui::Ui, (summary, texture): &(String, egui::TextureHandle)) {
+    ui.horizontal_wrapped(|ui| {
+        for (.., color, name) in LEGEND {
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+            let [r, g, b] = rgb(color);
+            ui.painter().rect_filled(rect, 2.0, egui::Color32::from_rgb(r, g, b));
+            ui.label(name);
+            ui.add_space(8.0);
+        }
+    });
+    ui.label(summary);
+    ui.add(egui::Image::new(texture).shrink_to_fit());
+}
+
+/// 每 `step` 像素取一點，用每個地點的顏色畫成縮圖。
+fn preview(
+    map: &eu5_rnw_core::locations::LocationMap,
+    step: usize,
+    colors: &[[u8; 3]],
+) -> egui::ColorImage {
+    let (w, h) = (map.width / step, map.height / step);
+    let mut pixels = Vec::with_capacity(w * h * 3);
+    for y in 0..h {
+        for x in 0..w {
+            pixels.extend_from_slice(&colors[usize::from(map.label(x * step, y * step))]);
+        }
+    }
+    egui::ColorImage::from_rgb([w, h], &pixels)
+}
+
+fn rgb(color: u32) -> [u8; 3] {
+    let [_, r, g, b] = color.to_be_bytes();
+    [r, g, b]
 }
 
 /// egui 內建字型沒有中文字，從 Windows 載入微軟正黑體。

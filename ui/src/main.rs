@@ -1,7 +1,7 @@
 //! eu5-rnw 的視窗（egui）。
 //!
 //! 版型：上方標題列、左側設定面板、中央地圖區、下方狀態列。
-//! 中央先顯示原版地圖（新世界另外上色）；「生成」之後會呼叫 `core/` 的產生器。
+//! 中央先顯示原版地圖（新世界另外上色）；按「生成」後換成 `core/` 產生的新地圖。
 //! 讀檔等慢的工作都在背景執行緒做，視窗不會卡住。
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
@@ -113,6 +113,8 @@ struct App {
     reach_px: u32,
     domain_check: Task<(String, egui::TextureHandle)>,
     land_check: Task<(String, egui::TextureHandle)>,
+    /// 產生器頁「生成」的結果；`Idle` 時中央顯示原版地圖。
+    generated: Task<(String, egui::TextureHandle)>,
     /// 中央的原版地圖（步驟 4），啟動時開始讀。
     vanilla: Task<(String, egui::TextureHandle)>,
 }
@@ -138,6 +140,7 @@ impl App {
             reach_px: eu5_rnw_core::domain::REACH_PX,
             domain_check: Task::Idle,
             land_check: Task::Idle,
+            generated: Task::Idle,
             vanilla,
         }
     }
@@ -240,15 +243,14 @@ impl App {
         ));
         let (seed, reach) = (self.seed, self.reach_px);
         self.land_check.button(ui, move |ctx| land_map(ctx, seed, key, reach));
-        self.land_check.show(ui, |ui, (summary, texture)| {
-            ui.horizontal_wrapped(|ui| {
-                for (color, name) in LAND_LEGEND {
-                    swatch(ui, color, name);
-                }
-            });
-            ui.label(summary);
-            wide_image(ui, texture);
-        });
+        self.land_check.show(ui, |ui, land| show_land(ui, land, wide_image));
+        ui.add_space(12.0);
+
+        ui.strong("8. 「生成」按鈕");
+        ui.weak(
+            "到「產生器」頁選世界類型和種子，按「生成」：中央會換成新地圖（和 7b 同一套做法）。\
+             同一組設定按兩次結果相同；按「回到原版地圖」可以切回原版。",
+        );
     }
 
     fn settings(&mut self, ui: &mut egui::Ui) {
@@ -274,9 +276,15 @@ impl App {
         });
         ui.add_space(16.0);
 
-        if ui.add_sized([ui.available_width(), 32.0], egui::Button::new("生成")).clicked() {
+        let running = matches!(self.generated, Task::Running(_));
+        let generate = egui::Button::new(if running { "生成中…" } else { "生成" });
+        if ui.add_enabled_ui(!running, |ui| ui.add_sized([ui.available_width(), 32.0], generate)).inner.clicked() {
             let (key, _) = PRESETS[self.preset];
-            self.status = format!("尚未實作：將以 {key}、種子 {} 生成", self.seed);
+            let (seed, reach) = (self.seed, self.reach_px);
+            self.generated.start(ui.ctx(), move |ctx| land_map(ctx, seed, key, reach));
+        }
+        if !matches!(self.generated, Task::Idle) && ui.button("回到原版地圖").clicked() {
+            self.generated = Task::Idle;
         }
     }
 }
@@ -306,8 +314,13 @@ impl eframe::App for App {
             .exact_size(240.0)
             .show(ui, |ui| self.settings(ui));
         egui::CentralPanel::default_margins().show(ui, |ui| {
-            ui.weak("原版地圖（生成後會換成新地圖）");
-            self.vanilla.show(ui, |ui, map| show_map(ui, map, fit_image));
+            if matches!(self.generated, Task::Idle) {
+                ui.weak("原版地圖（按「生成」換成新地圖）");
+                self.vanilla.show(ui, |ui, map| show_map(ui, map, fit_image));
+            } else {
+                ui.weak("生成的新地圖");
+                self.generated.show(ui, |ui, land| show_land(ui, land, fit_image));
+            }
         });
     }
 }
@@ -445,6 +458,21 @@ fn show_map(
 ) {
     ui.horizontal_wrapped(|ui| {
         for (.., color, name) in LEGEND {
+            swatch(ui, color, name);
+        }
+    });
+    ui.label(summary);
+    image(ui, texture);
+}
+
+/// 畫生成的陸海圖、圖例與說明。
+fn show_land(
+    ui: &mut egui::Ui,
+    (summary, texture): &(String, egui::TextureHandle),
+    image: fn(&mut egui::Ui, &egui::TextureHandle),
+) {
+    ui.horizontal_wrapped(|ui| {
+        for (color, name) in LAND_LEGEND {
             swatch(ui, color, name);
         }
     });

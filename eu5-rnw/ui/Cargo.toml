@@ -1,0 +1,10 @@
+[package]
+name = "eu5-rnw"
+version = "0.1.0"
+edition = "2024"
+description = "Window of the eu5-rnw generator (egui)"
+license = "MPL-2.0"
+publish = false
+
+[dependencies]
+eframe = "0.35.0"

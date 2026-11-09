@@ -1,0 +1,7 @@
+# eu5-rnw 的 Cargo workspace：所有成員共用一份 Cargo.lock 和 target/。
+# 編譯結果：target/release/eu5-rnw.exe
+[workspace]
+resolver = "3"
+members = ["ui"]
+# core 的草稿還沒有 lib.rs，等接上時再移到 members。
+exclude = ["core"]

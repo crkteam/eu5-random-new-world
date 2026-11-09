@@ -119,6 +119,8 @@ struct App {
     ids_check: Task<(String, egui::TextureHandle, egui::TextureHandle, egui::TextureHandle)>,
     /// 步驟 10：完整解析度的新地點圖（縮圖與原尺寸的一角）。
     full_check: Task<(String, egui::TextureHandle, egui::TextureHandle)>,
+    /// 步驟 11a：原版的高度貼花。
+    relief_check: Task<(String, egui::TextureHandle)>,
     /// 產生器頁「生成」的結果；`Idle` 時中央顯示原版地圖。
     generated: Task<(String, egui::TextureHandle)>,
     /// 中央的原版地圖（步驟 4），啟動時開始讀。
@@ -149,6 +151,7 @@ impl App {
             locations_check: Task::Idle,
             ids_check: Task::Idle,
             full_check: Task::Idle,
+            relief_check: Task::Idle,
             generated: Task::Idle,
             vanilla,
         }
@@ -308,6 +311,17 @@ impl App {
             wide_image(ui, whole);
             ui.add_space(4.0);
             wide_image(ui, close);
+        });
+        ui.add_space(12.0);
+
+        ui.strong("11a. 讀原版的高度貼花");
+        ui.weak(
+            "美洲的高低起伏不在 heightmap.png，而在 16 塊 4×4 鋪滿世界的高度貼花（每塊 8192×4096，每個地點像素 2×2 個貼花像素）。這裡解開遊戲實際讀的 .bin（每個 128×128 小塊一段 LZAV 壓縮），拼成全世界、每 8 個地點像素取一點：藍是低於 4000（海底約 2234），綠→黃→褐→白是越來越高。再和原版地點比對：高於 4000 的應該是陸地，其餘是海或湖。",
+        );
+        self.relief_check.button(ui, relief_map);
+        self.relief_check.show(ui, |ui, (summary, texture)| {
+            ui.label(summary);
+            wide_image(ui, texture);
         });
     }
 
@@ -755,6 +769,62 @@ fn full_map(
         ctx.load_texture("full", whole, egui::TextureOptions::LINEAR),
         ctx.load_texture("full_close", egui::ColorImage::from_rgb([cw, ch], &close), egui::TextureOptions::NEAREST),
     ))
+}
+
+/// 高於這個值算陸地（原專案量到海底約 2234、陸地約 5500 以上）。
+const LAND_HEIGHT: u16 = 4000;
+
+/// 步驟 11a：全世界的高度縮圖，並和原版地點的陸地／海比對。
+fn relief_map(ctx: &egui::Context) -> Outcome<(String, egui::TextureHandle)> {
+    use eu5_rnw_core::geography::Kind;
+
+    let game = eu5_rnw_core::game::choose_game(None).map_err(|e| e.to_string())?;
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let start = Instant::now();
+    let (w, h, heights) = eu5_rnw_core::terrain::sample_heights(&game.directory, 8, threads).map_err(|e| e.to_string())?;
+    let seconds = start.elapsed().as_secs_f64();
+    let map = read_location_map(&game.map_data()).map_err(|e| e.to_string())?;
+    let geo = read_geography(&game.map_data(), &map.locations).map_err(|e| e.to_string())?;
+    let new_world = geo.new_world()?;
+    let (lw, lh, labels) = map.downsample(8);
+    if (lw, lh) != (w, h) {
+        return Err(format!("heights {w}x{h} and locations {lw}x{lh} do not line up"));
+    }
+    let wet = |l: usize| matches!(geo.kind[l], Kind::Sea | Kind::Lake);
+    let agree = |only: &dyn Fn(usize) -> bool| {
+        let points: Vec<usize> = (0..labels.len()).filter(|&i| only(usize::from(labels[i]))).collect();
+        let same = points.iter().filter(|&&i| (heights[i] > LAND_HEIGHT) != wet(usize::from(labels[i]))).count();
+        same as f64 * 100.0 / points.len().max(1) as f64
+    };
+    let median = |keep: &dyn Fn(usize) -> bool| {
+        let mut v: Vec<u16> = (0..labels.len()).filter(|&i| keep(usize::from(labels[i]))).map(|i| heights[i]).collect();
+        v.sort_unstable();
+        v.get(v.len() / 2).copied().unwrap_or(0)
+    };
+    let pixels: Vec<u8> = heights
+        .iter()
+        .flat_map(|&v| {
+            if v <= LAND_HEIGHT {
+                let t = u32::from(v) * 255 / u32::from(LAND_HEIGHT);
+                return rgb((0x10 + t / 6) << 16 | (0x30 + t / 4) << 8 | (0x60 + t / 3));
+            }
+            // 4000→綠、12000→黃、20000→褐、30000 以上→白。
+            let stops = [(4000.0, [70.0, 140.0, 60.0]), (12000.0, [210.0, 200.0, 90.0]), (20000.0, [140.0, 95.0, 60.0]), (30000.0, [245.0, 245.0, 245.0])];
+            let v = f64::from(v).min(30000.0);
+            let k = stops.windows(2).position(|s| v <= s[1].0).unwrap_or(2);
+            let (a, b) = (stops[k], stops[k + 1]);
+            let t = (v - a.0) / (b.0 - a.0);
+            [0, 1, 2].map(|c| (a.1[c] + (b.1[c] - a.1[c]) * t) as u8)
+        })
+        .collect();
+    let summary = format!(
+        "{w}×{h}（每 8 個地點像素一點）。解開 16 塊貼花 {seconds:.2} 秒。海的中位數 {}、陸地 {}。高度和原版陸地／海一致的比例：全世界 {:.1}%、新世界 {:.1}%。",
+        median(&|l| geo.kind[l] == Kind::Sea),
+        median(&|l| !wet(l)),
+        agree(&|l| geo.continent[l].is_some()),
+        agree(&|l| new_world[l]),
+    );
+    Ok((summary, ctx.load_texture("relief", egui::ColorImage::from_rgb([w, h], &pixels), egui::TextureOptions::LINEAR)))
 }
 
 /// 名稱的固定顏色（亮度 0x50～0xe0）。

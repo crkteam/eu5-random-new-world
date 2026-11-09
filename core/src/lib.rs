@@ -5,4 +5,5 @@ pub mod game;
 pub mod geography;
 pub mod locations;
 pub mod pdx;
+pub mod rng;
 pub mod vdf;

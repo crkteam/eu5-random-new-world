@@ -107,6 +107,7 @@ struct App {
     game_check: Task<String>,
     map_check: Task<(String, egui::TextureHandle)>,
     geography_check: Task<String>,
+    rng_check: Task<String>,
     /// 中央的原版地圖（步驟 4），啟動時開始讀。
     vanilla: Task<(String, egui::TextureHandle)>,
 }
@@ -127,6 +128,7 @@ impl App {
             game_check: Task::Idle,
             map_check: Task::Idle,
             geography_check: Task::Idle,
+            rng_check: Task::Idle,
             vanilla,
         }
     }
@@ -169,6 +171,19 @@ impl App {
         ui.weak("視窗啟動時就在背景讀取；結果在「產生器」頁中央，這裡也顯示一份。按「執行」重新讀。");
         self.vanilla.button(ui, vanilla_map);
         self.vanilla.show(ui, show_map);
+        ui.add_space(12.0);
+
+        ui.strong("5. 可重現的亂數");
+        ui.weak(format!(
+            "用「產生器」頁設定的種子（目前 {}）：前 5 個數產生兩次要相同；\
+             再用 1、2、8 個和全部核心的執行緒各算前 1000 萬個數，檢查碼要全部相同。",
+            self.seed
+        ));
+        let seed = self.seed;
+        self.rng_check.button(ui, move |_| Ok(check_rng(seed)));
+        self.rng_check.show(ui, |ui, text| {
+            ui.label(text);
+        });
     }
 
     fn settings(&mut self, ui: &mut egui::Ui) {
@@ -290,6 +305,30 @@ fn check_geography() -> Outcome<String> {
         count(Kind::Sea),
         unplaced.len(),
     ))
+}
+
+/// 步驟 5：同一個種子兩次產生的數列，以及不同執行緒數算出的檢查碼。
+fn check_rng(seed: u64) -> String {
+    use eu5_rnw_core::rng::{Rng, checksum};
+
+    let first = |seed| {
+        let mut rng = Rng::new(seed);
+        (0..5).map(|_| rng.next_u64()).collect::<Vec<_>>()
+    };
+    let (a, b) = (first(seed), first(seed));
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get() as u64);
+    let sums: Vec<(u64, u64)> =
+        [1, 2, 8, cores].into_iter().map(|t| (t, checksum(seed, 10_000_000, t))).collect();
+    let same = sums.iter().all(|&(_, sum)| sum == sums[0].1);
+    let mut text = format!(
+        "第一次：{a:?}\n第二次：{b:?}\n{}\n",
+        if a == b { "兩次相同 ✔" } else { "兩次不同 ✘" }
+    );
+    for (threads, sum) in &sums {
+        text += &format!("{threads} 個執行緒：檢查碼 {sum:016x}\n");
+    }
+    text += if same { "所有執行緒數結果相同 ✔" } else { "執行緒數不同、結果不同 ✘" };
+    text
 }
 
 /// 地圖圖例：（是否新世界, 類別, 顏色, 說明）。無主地與無法通行用同一色。

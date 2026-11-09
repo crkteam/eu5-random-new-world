@@ -1,26 +1,11 @@
-.venv/
-__pycache__/
-.pytest_cache/
-.ruff_cache/
-.mypy_cache/
-.coverage
-dist/
-build/
-*.egg-info/
-third_party/
-generated/
-local_data/
-experiments/*/output/
-*.log
-*.so
-*.pyd
-# Local notes and backups that never belong in the repository.
-.debug-journal.md
-*.bundle
-# The Tauri window's dependencies and builds.
-desktop/node_modules/
-desktop/dist/
-desktop/src-tauri/target/
-desktop/src-tauri/gen/
-website/node_modules/
-website/.wrangler/
+# 編譯結果。
+/target/
+# 生成的 mod 是遊戲衍生資料，只留在本機。
+/generated/
+
+# 系統與編輯器的雜檔；old/ 另有自己的 .gitignore。
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/

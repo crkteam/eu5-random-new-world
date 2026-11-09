@@ -1,0 +1,26 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+dist/
+build/
+*.egg-info/
+third_party/
+generated/
+local_data/
+experiments/*/output/
+*.log
+*.so
+*.pyd
+# Local notes and backups that never belong in the repository.
+.debug-journal.md
+*.bundle
+# The Tauri window's dependencies and builds.
+desktop/node_modules/
+desktop/dist/
+desktop/src-tauri/target/
+desktop/src-tauri/gen/
+website/node_modules/
+website/.wrangler/

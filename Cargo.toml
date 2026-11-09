@@ -3,6 +3,8 @@
 [workspace]
 resolver = "3"
 members = ["core", "ui"]
+# old/ 是原專案，裡面有自己的 Cargo 專案（native/、desktop/src-tauri/）。
+exclude = ["old"]
 
 # 生成地圖是大量數值運算，release 版開滿優化。
 [profile.release]

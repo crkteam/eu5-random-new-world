@@ -2,5 +2,6 @@
 
 pub mod error;
 pub mod game;
+pub mod locations;
 pub mod pdx;
 pub mod vdf;

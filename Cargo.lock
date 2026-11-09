@@ -996,6 +996,9 @@ dependencies = [
 [[package]]
 name = "eu5-rnw-core"
 version = "0.1.0"
+dependencies = [
+ "png",
+]
 
 [[package]]
 name = "euclid"

@@ -112,6 +112,7 @@ struct App {
     /// 步驟 7a：遠洋延伸距離（原圖像素）與範圍圖。
     reach_px: u32,
     domain_check: Task<(String, egui::TextureHandle)>,
+    land_check: Task<(String, egui::TextureHandle)>,
     /// 中央的原版地圖（步驟 4），啟動時開始讀。
     vanilla: Task<(String, egui::TextureHandle)>,
 }
@@ -136,6 +137,7 @@ impl App {
             height_check: Task::Idle,
             reach_px: eu5_rnw_core::domain::REACH_PX,
             domain_check: Task::Idle,
+            land_check: Task::Idle,
             vanilla,
         }
     }
@@ -221,6 +223,26 @@ impl App {
         self.domain_check.show(ui, |ui, (summary, texture)| {
             ui.horizontal_wrapped(|ui| {
                 for (color, name) in DOMAIN_LEGEND {
+                    swatch(ui, color, name);
+                }
+            });
+            ui.label(summary);
+            wide_image(ui, texture);
+        });
+        ui.add_space(12.0);
+
+        ui.strong("7b. 切出陸地與海洋");
+        let (key, name) = PRESETS[self.preset];
+        ui.weak(format!(
+            "用「產生器」頁的世界類型（目前：{name}）與種子（{}），在 7a 的範圍（延伸 {} 像素）裡：\
+             依陸地比例取最高的格子當陸地，範圍邊緣附近一律是海，再清掉太小的島和湖。參數照原專案各世界類型的預設值。",
+            self.seed, self.reach_px
+        ));
+        let (seed, reach) = (self.seed, self.reach_px);
+        self.land_check.button(ui, move |ctx| land_map(ctx, seed, key, reach));
+        self.land_check.show(ui, |ui, (summary, texture)| {
+            ui.horizontal_wrapped(|ui| {
+                for (color, name) in LAND_LEGEND {
                     swatch(ui, color, name);
                 }
             });
@@ -448,11 +470,25 @@ const DOMAIN_LEGEND: [(u32, &str); 5] = [
     (0x9a9586, "其他陸地、湖、荒地"),
 ];
 
-/// 步驟 7a：生成範圍＝新世界＋延伸距離內、緩衝外的大西洋與太平洋，每 4 像素一格。
-fn domain_map(ctx: &egui::Context, reach_px: u32) -> Outcome<(String, egui::TextureHandle)> {
+/// 步驟 7a、7b 共用：讀地圖，算出縮小的標籤圖與生成範圍。
+struct Canvas {
+    width: usize,
+    height: usize,
+    labels: Vec<eu5_rnw_core::locations::Label>,
+    new_world: Vec<bool>,
+    ocean: Vec<bool>,
+    sea: Vec<bool>,
+    domain: Vec<bool>,
+    /// 算範圍花的秒數（不含讀檔）。
+    seconds: f64,
+}
+
+/// 每格 4 原圖像素。
+const STEP: usize = 4;
+
+fn canvas(reach_px: u32) -> Outcome<Canvas> {
     use eu5_rnw_core::domain::{GUARD_PX, OCEANS, new_world_domain};
 
-    const STEP: usize = 4;
     let map_data = eu5_rnw_core::game::choose_game(None).map_err(|e| e.to_string())?.map_data();
     let map = read_location_map(&map_data).map_err(|e| e.to_string())?;
     let geo = read_geography(&map_data, &map.locations).map_err(|e| e.to_string())?;
@@ -460,16 +496,88 @@ fn domain_map(ctx: &egui::Context, reach_px: u32) -> Outcome<(String, egui::Text
     let new_world = geo.new_world()?;
     let ocean = geo.on_continents(&OCEANS)?;
     let sea: Vec<bool> = geo.kind.iter().map(|&k| k == Kind::Sea).collect();
-    let (w, h, labels) = map.downsample(STEP);
+    let (width, height, labels) = map.downsample(STEP);
     let start = Instant::now();
     let domain = new_world_domain(
         &labels,
-        (w, h),
+        (width, height),
         (&new_world, &ocean, &sea),
         reach_px / STEP as u32,
         GUARD_PX / STEP as u32,
     );
     let seconds = start.elapsed().as_secs_f64();
+    Ok(Canvas { width, height, labels, new_world, ocean, sea, domain, seconds })
+}
+
+/// 步驟 7b 的圖例。
+const LAND_LEGEND: [(u32, &str); 5] = [
+    (0x6dbb4f, "新陸地"),
+    (0x7fc4e8, "新湖泊"),
+    (0x2f6f9f, "新海洋"),
+    (0x1e3550, "範圍外的海"),
+    (0x9a9586, "範圍外的陸地"),
+];
+
+/// 步驟 7b：在範圍內切出陸地與海洋。
+fn land_map(ctx: &egui::Context, seed: u64, key: &str, reach_px: u32) -> Outcome<(String, egui::TextureHandle)> {
+    use eu5_rnw_core::land::{Cell, components, cut, preset};
+
+    let params = preset(key).ok_or_else(|| format!("unknown world type {key}"))?;
+    let c = canvas(reach_px)?;
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let start = Instant::now();
+    let cells = cut(seed, &params, (c.width, c.height, STEP), &c.domain, threads)?;
+    let seconds = start.elapsed().as_secs_f64();
+
+    let land: Vec<bool> = cells.iter().map(|&cell| cell == Cell::Land).collect();
+    let (_, mut sizes) = components(&land, (c.width, c.height));
+    sizes.sort_unstable_by(|a, b| b.cmp(a));
+    let total: usize = sizes.iter().sum();
+    let inside = c.domain.iter().filter(|&&d| d).count();
+    let lakes = cells.iter().filter(|&&cell| cell == Cell::Lake).count();
+    let big = sizes.iter().filter(|&&s| s * 100 >= total * 3).count();
+    let largest: Vec<String> =
+        sizes.iter().take(4).map(|&s| format!("{:.0}%", s as f64 * 100.0 / total.max(1) as f64)).collect();
+    let pixels: Vec<u8> = cells
+        .iter()
+        .zip(&c.labels)
+        .flat_map(|(&cell, &label)| {
+            let color = match cell {
+                Cell::Land => LAND_LEGEND[0].0,
+                Cell::Lake => LAND_LEGEND[1].0,
+                Cell::Sea => LAND_LEGEND[2].0,
+                Cell::Outside if c.sea[usize::from(label)] => LAND_LEGEND[3].0,
+                Cell::Outside => LAND_LEGEND[4].0,
+            };
+            rgb(color)
+        })
+        .collect();
+    let summary = format!(
+        "種子 {seed}、{key}：陸地 {total} 格（範圍的 {:.1}%，目標 {:.1}%），湖 {lakes} 格；\
+         {} 塊陸地，其中 {big} 塊佔陸地 3% 以上，最大幾塊 {}；\
+         特徵寬度 {} 像素、{} 層、persistence {}、最小島 {} 像素；切陸地 {seconds:.2} 秒。",
+        total as f64 * 100.0 / inside.max(1) as f64,
+        params.land_share * 100.0,
+        sizes.len(),
+        largest.join("、"),
+        params.noise.feature_px,
+        params.noise.octaves,
+        params.noise.persistence,
+        params.min_island_px,
+    );
+    let options = egui::TextureOptions {
+        mipmap_mode: Some(egui::TextureFilter::Linear),
+        ..egui::TextureOptions::LINEAR
+    };
+    let image = egui::ColorImage::from_rgb([c.width, c.height], &pixels);
+    Ok((summary, ctx.load_texture("land", image, options)))
+}
+
+/// 步驟 7a：生成範圍＝新世界＋延伸距離內、緩衝外的大西洋與太平洋，每 4 像素一格。
+fn domain_map(ctx: &egui::Context, reach_px: u32) -> Outcome<(String, egui::TextureHandle)> {
+    use eu5_rnw_core::domain::GUARD_PX;
+
+    let Canvas { width: w, height: h, labels, new_world, ocean, sea, domain, seconds } = canvas(reach_px)?;
 
     let (mut original, mut added) = (0usize, 0usize);
     let pixels: Vec<u8> = labels

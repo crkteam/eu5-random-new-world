@@ -4,6 +4,7 @@ pub mod domain;
 pub mod error;
 pub mod game;
 pub mod geography;
+pub mod land;
 pub mod locations;
 pub mod noise;
 pub mod pdx;

@@ -150,7 +150,7 @@ fn clean(land: &[bool], domain: &[bool], (width, height, step): (usize, usize, u
 }
 
 /// 上下左右的鄰居；x 方向左右相接。
-fn neighbours(index: usize, (width, height): (usize, usize)) -> impl Iterator<Item = usize> {
+pub(crate) fn neighbours(index: usize, (width, height): (usize, usize)) -> impl Iterator<Item = usize> {
     let (x, y) = (index % width, index / width);
     let left = y * width + (x + width - 1) % width;
     let right = y * width + (x + 1) % width;

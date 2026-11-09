@@ -3,7 +3,9 @@
 pub mod domain;
 pub mod error;
 pub mod game;
+pub mod generate;
 pub mod geography;
+pub mod islands;
 pub mod land;
 pub mod locations;
 pub mod noise;

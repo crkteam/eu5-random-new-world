@@ -238,7 +238,8 @@ impl App {
         let (key, name) = PRESETS[self.preset];
         ui.weak(format!(
             "用「產生器」頁的世界類型（目前：{name}）與種子（{}），在 7a 的範圍（延伸 {} 像素）裡：\
-             依陸地比例取最高的格子當陸地，範圍邊緣附近一律是海，再清掉太小的島和湖。參數照原專案各世界類型的預設值。",
+             依陸地比例取最高的格子當陸地，範圍邊緣附近一律是海，再清掉太小的島和湖。參數照原專案各世界類型的預設值。\
+             範圍裡的原版小島（百慕達、聖赫勒拿、復活節島等）保留；被新陸地碰到的島群整群搬到最近的外海（盡量維持緯度）。",
             self.seed, self.reach_px
         ));
         let (seed, reach) = (self.seed, self.reach_px);
@@ -498,43 +499,13 @@ const DOMAIN_LEGEND: [(u32, &str); 5] = [
     (0x9a9586, "其他陸地、湖、荒地"),
 ];
 
-/// 步驟 7a、7b 共用：讀地圖，算出縮小的標籤圖與生成範圍。
-struct Canvas {
-    width: usize,
-    height: usize,
-    labels: Vec<eu5_rnw_core::locations::Label>,
-    new_world: Vec<bool>,
-    ocean: Vec<bool>,
-    sea: Vec<bool>,
-    domain: Vec<bool>,
-    /// 算範圍花的秒數（不含讀檔）。
-    seconds: f64,
-}
-
 /// 每格 4 原圖像素。
 const STEP: usize = 4;
 
-fn canvas(reach_px: u32) -> Outcome<Canvas> {
-    use eu5_rnw_core::domain::{GUARD_PX, OCEANS, new_world_domain};
-
+/// 步驟 7a、7b、8 共用：用 core 讀地圖並決定生成範圍。
+fn canvas(reach_px: u32) -> Outcome<eu5_rnw_core::generate::Canvas> {
     let map_data = eu5_rnw_core::game::choose_game(None).map_err(|e| e.to_string())?.map_data();
-    let map = read_location_map(&map_data).map_err(|e| e.to_string())?;
-    let geo = read_geography(&map_data, &map.locations).map_err(|e| e.to_string())?;
-    geo.unplaced(&map.locations, &map.pixel_counts())?;
-    let new_world = geo.new_world()?;
-    let ocean = geo.on_continents(&OCEANS)?;
-    let sea: Vec<bool> = geo.kind.iter().map(|&k| k == Kind::Sea).collect();
-    let (width, height, labels) = map.downsample(STEP);
-    let start = Instant::now();
-    let domain = new_world_domain(
-        &labels,
-        (width, height),
-        (&new_world, &ocean, &sea),
-        reach_px / STEP as u32,
-        GUARD_PX / STEP as u32,
-    );
-    let seconds = start.elapsed().as_secs_f64();
-    Ok(Canvas { width, height, labels, new_world, ocean, sea, domain, seconds })
+    eu5_rnw_core::generate::read_canvas(&map_data, STEP, reach_px)
 }
 
 /// 步驟 7b 的圖例。
@@ -542,33 +513,35 @@ const LAND_LEGEND: [(u32, &str); 5] = [
     (0x6dbb4f, "新陸地"),
     (0x7fc4e8, "新湖泊"),
     (0x2f6f9f, "新海洋"),
-    (0x1e3550, "範圍外的海"),
-    (0x9a9586, "範圍外的陸地"),
+    (0x1e3550, "範圍外與島群的海"),
+    (0x9a9586, "範圍外與島群的陸地"),
 ];
 
-/// 步驟 7b：在範圍內切出陸地與海洋。
+/// 步驟 7b、8：在範圍內生成新世界，保留並必要時搬移原版島群。
 fn land_map(ctx: &egui::Context, seed: u64, key: &str, reach_px: u32) -> Outcome<(String, egui::TextureHandle)> {
-    use eu5_rnw_core::land::{Cell, components, cut, preset};
+    use eu5_rnw_core::land::{Cell, components, preset};
 
     let params = preset(key).ok_or_else(|| format!("unknown world type {key}"))?;
     let c = canvas(reach_px)?;
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
     let start = Instant::now();
-    let cells = cut(seed, &params, (c.width, c.height, STEP), &c.domain, threads)?;
+    let world = eu5_rnw_core::generate::generate(&c, seed, &params, threads)?;
     let seconds = start.elapsed().as_secs_f64();
 
-    let land: Vec<bool> = cells.iter().map(|&cell| cell == Cell::Land).collect();
+    let land: Vec<bool> = world.cells.iter().map(|&cell| cell == Cell::Land).collect();
     let (_, mut sizes) = components(&land, (c.width, c.height));
     sizes.sort_unstable_by(|a, b| b.cmp(a));
     let total: usize = sizes.iter().sum();
     let inside = c.domain.iter().filter(|&&d| d).count();
-    let lakes = cells.iter().filter(|&&cell| cell == Cell::Lake).count();
+    let lakes = world.cells.iter().filter(|&&cell| cell == Cell::Lake).count();
     let big = sizes.iter().filter(|&&s| s * 100 >= total * 3).count();
     let largest: Vec<String> =
         sizes.iter().take(4).map(|&s| format!("{:.0}%", s as f64 * 100.0 / total.max(1) as f64)).collect();
-    let pixels: Vec<u8> = cells
+    let moved = world.moves.iter().filter(|&&m| m != (0, 0)).count();
+    let pixels: Vec<u8> = world
+        .cells
         .iter()
-        .zip(&c.labels)
+        .zip(&world.labels)
         .flat_map(|(&cell, &label)| {
             let color = match cell {
                 Cell::Land => LAND_LEGEND[0].0,
@@ -583,11 +556,13 @@ fn land_map(ctx: &egui::Context, seed: u64, key: &str, reach_px: u32) -> Outcome
     let summary = format!(
         "種子 {seed}、{key}：陸地 {total} 格（範圍的 {:.1}%，目標 {:.1}%），湖 {lakes} 格；\
          {} 塊陸地，其中 {big} 塊佔陸地 3% 以上，最大幾塊 {}；\
-         特徵寬度 {} 像素、{} 層、persistence {}、最小島 {} 像素；切陸地 {seconds:.2} 秒。",
+         原版島群 {} 群，{moved} 群被新陸地碰到而搬到外海；\
+         特徵寬度 {} 像素、{} 層、persistence {}、最小島 {} 像素；生成 {seconds:.2} 秒。",
         total as f64 * 100.0 / inside.max(1) as f64,
         params.land_share * 100.0,
         sizes.len(),
         largest.join("、"),
+        world.groups.len(),
         params.noise.feature_px,
         params.noise.octaves,
         params.noise.persistence,
@@ -605,23 +580,24 @@ fn land_map(ctx: &egui::Context, seed: u64, key: &str, reach_px: u32) -> Outcome
 fn domain_map(ctx: &egui::Context, reach_px: u32) -> Outcome<(String, egui::TextureHandle)> {
     use eu5_rnw_core::domain::GUARD_PX;
 
-    let Canvas { width: w, height: h, labels, new_world, ocean, sea, domain, seconds } = canvas(reach_px)?;
-
+    let c = canvas(reach_px)?;
+    let (w, h) = (c.width, c.height);
     let (mut original, mut added) = (0usize, 0usize);
-    let pixels: Vec<u8> = labels
+    let pixels: Vec<u8> = c
+        .labels
         .iter()
-        .zip(&domain)
+        .zip(&c.domain)
         .flat_map(|(&label, &inside)| {
             let l = usize::from(label);
-            let color = if new_world[l] {
+            let color = if c.new_world[l] {
                 original += 1;
                 DOMAIN_LEGEND[0].0
             } else if inside {
                 added += 1;
                 DOMAIN_LEGEND[1].0
-            } else if ocean[l] && sea[l] {
+            } else if c.ocean[l] && c.sea[l] {
                 DOMAIN_LEGEND[2].0
-            } else if sea[l] {
+            } else if c.sea[l] {
                 DOMAIN_LEGEND[3].0
             } else {
                 DOMAIN_LEGEND[4].0
@@ -631,7 +607,7 @@ fn domain_map(ctx: &egui::Context, reach_px: u32) -> Outcome<(String, egui::Text
         .collect();
     let summary = format!(
         "延伸 {reach_px} 像素、緩衝 {GUARD_PX} 像素：原版新世界 {original} 格，加上遠洋 {added} 格，範圍共 {} 格\
-         （原版的 {:.1} 倍，佔整張地圖 {:.1}%）；算範圍 {seconds:.2} 秒。",
+         （原版的 {:.1} 倍，佔整張地圖 {:.1}%）。",
         original + added,
         (original + added) as f64 / original.max(1) as f64,
         (original + added) as f64 * 100.0 / (w * h) as f64,

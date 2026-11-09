@@ -115,6 +115,8 @@ struct App {
     land_check: Task<(String, egui::TextureHandle)>,
     /// 步驟 9：整張圖與放大的一角。
     locations_check: Task<(String, egui::TextureHandle, egui::TextureHandle)>,
+    /// 步驟 9b：原版區域、新地圖區域、放大的地區與省。
+    ids_check: Task<(String, egui::TextureHandle, egui::TextureHandle, egui::TextureHandle)>,
     /// 產生器頁「生成」的結果；`Idle` 時中央顯示原版地圖。
     generated: Task<(String, egui::TextureHandle)>,
     /// 中央的原版地圖（步驟 4），啟動時開始讀。
@@ -143,6 +145,7 @@ impl App {
             domain_check: Task::Idle,
             land_check: Task::Idle,
             locations_check: Task::Idle,
+            ids_check: Task::Idle,
             generated: Task::Idle,
             vanilla,
         }
@@ -241,7 +244,7 @@ impl App {
         let (key, name) = PRESETS[self.preset];
         ui.weak(format!(
             "用「產生器」頁的世界類型（目前：{name}）與種子（{}），在 7a 的範圍（延伸 {} 像素）裡：\
-             依陸地比例取最高的格子當陸地，範圍邊緣附近一律是海，再清掉太小的島和湖。參數照原專案各世界類型的預設值。\
+             依陸地比例取最高的格子當陸地，範圍邊緣附近一律是海，再清掉太小的島；被陸地包住的小片水填成陸地（湖在 9b 從原版放進來）。參數照原專案各世界類型的預設值。\
              範圍裡的原版小島（百慕達、聖赫勒拿、復活節島等）保留；被新陸地碰到的島群整群搬到最近的外海（盡量維持緯度）。",
             self.seed, self.reach_px
         ));
@@ -259,7 +262,7 @@ impl App {
 
         ui.strong("9a. 切成地點");
         ui.weak(format!(
-            "用 7b 同一組設定（{name}、種子 {}）生成後，把新陸地切成和範圍內原版陸地地點一樣多塊，             水域切成和原版海、湖地點一樣多塊（每個湖一塊，其餘給海）。每塊都上下左右相連，             大小盡量平均。每個地點一種顏色、深色線是地點邊界；下面第二張是陸地中心附近放大（每格 4 像素）。             哪一塊對應哪個原版地點（讓省、區域維持在一起）是 9b。",
+            "用 7b 同一組設定（{name}、種子 {}）生成後，把新陸地切成和範圍內原版陸地地點加湖一樣多塊，海切成和原版海一樣多塊。每塊都上下左右相連，大小盡量平均。每個地點一種顏色、深色線是地點邊界；下面第二張是陸地中心附近放大（每格 4 像素）。",
             self.seed
         ));
         let (seed, reach) = (self.seed, self.reach_px);
@@ -268,6 +271,24 @@ impl App {
             ui.label(summary);
             wide_image(ui, whole);
             ui.add_space(4.0);
+            wide_image(ui, close);
+        });
+        ui.add_space(12.0);
+
+        ui.strong("9b. 對應原版地點");
+        ui.weak(format!(
+            "接著 9a（{name}、種子 {}），照原版階層由上往下分：次大陸 → 區域 → 地區 → 省 → 地點，每一層的地點數照原版，每一刀沿原版各組排得較開的方向（東西或南北）切，相對位置才像原版。原版的湖放進它所屬省裡不碰水的地點。第一張是原版的區域，第二張是新地圖的區域，同一個區域同一種顏色（陸地亮、海暗，湖是淺藍）。第三張是陸地中心附近放大：顏色是地區，黑線是省界，淡線是地點邊界。",
+            self.seed
+        ));
+        let (seed, reach) = (self.seed, self.reach_px);
+        self.ids_check.button(ui, move |ctx| ids_map(ctx, seed, key, reach));
+        self.ids_check.show(ui, |ui, (summary, vanilla, new, close)| {
+            ui.label(summary);
+            ui.label("原版的區域");
+            wide_image(ui, vanilla);
+            ui.label("新地圖的區域");
+            wide_image(ui, new);
+            ui.label("放大：地區與省");
             wide_image(ui, close);
         });
     }
@@ -527,9 +548,8 @@ fn canvas(reach_px: u32) -> Outcome<eu5_rnw_core::generate::Canvas> {
 }
 
 /// 步驟 7b 的圖例。
-const LAND_LEGEND: [(u32, &str); 5] = [
+const LAND_LEGEND: [(u32, &str); 4] = [
     (0x6dbb4f, "新陸地"),
-    (0x7fc4e8, "新湖泊"),
     (0x2f6f9f, "新海洋"),
     (0x1e3550, "範圍外與島群的海"),
     (0x9a9586, "範圍外與島群的陸地"),
@@ -551,7 +571,6 @@ fn land_map(ctx: &egui::Context, seed: u64, key: &str, reach_px: u32) -> Outcome
     sizes.sort_unstable_by(|a, b| b.cmp(a));
     let total: usize = sizes.iter().sum();
     let inside = c.domain.iter().filter(|&&d| d).count();
-    let lakes = world.cells.iter().filter(|&&cell| cell == Cell::Lake).count();
     let big = sizes.iter().filter(|&&s| s * 100 >= total * 3).count();
     let largest: Vec<String> =
         sizes.iter().take(4).map(|&s| format!("{:.0}%", s as f64 * 100.0 / total.max(1) as f64)).collect();
@@ -562,17 +581,16 @@ fn land_map(ctx: &egui::Context, seed: u64, key: &str, reach_px: u32) -> Outcome
         .zip(&world.labels)
         .flat_map(|(&cell, &label)| {
             let color = match cell {
-                Cell::Land => LAND_LEGEND[0].0,
-                Cell::Lake => LAND_LEGEND[1].0,
-                Cell::Sea => LAND_LEGEND[2].0,
-                Cell::Outside if c.sea[usize::from(label)] => LAND_LEGEND[3].0,
-                Cell::Outside => LAND_LEGEND[4].0,
+                Cell::Land | Cell::Lake => LAND_LEGEND[0].0,
+                Cell::Sea => LAND_LEGEND[1].0,
+                Cell::Outside if c.sea[usize::from(label)] => LAND_LEGEND[2].0,
+                Cell::Outside => LAND_LEGEND[3].0,
             };
             rgb(color)
         })
         .collect();
     let summary = format!(
-        "種子 {seed}、{key}：陸地 {total} 格（範圍的 {:.1}%，目標 {:.1}%），湖 {lakes} 格；\
+        "種子 {seed}、{key}：陸地 {total} 格（範圍的 {:.1}%，目標 {:.1}%）；\
          {} 塊陸地，其中 {big} 塊佔陸地 3% 以上，最大幾塊 {}；\
          原版島群 {} 群，{moved} 群被新陸地碰到而搬到外海；\
          特徵寬度 {} 像素、{} 層、persistence {}、最小島 {} 像素；生成 {seconds:.2} 秒。",
@@ -616,7 +634,7 @@ fn locations_map(
     let color = |i: usize| -> u32 {
         let p = part[i];
         if p == u32::MAX {
-            return if c.sea[usize::from(world.labels[i])] { LAND_LEGEND[3].0 } else { LAND_LEGEND[4].0 };
+            return if c.sea[usize::from(world.labels[i])] { LAND_LEGEND[2].0 } else { LAND_LEGEND[3].0 };
         }
         let right = i / w * w + (i + 1) % w;
         if (i + w < part.len() && part[i + w] != p) || part[right] != p {
@@ -625,8 +643,7 @@ fn locations_map(
         let r = eu5_rnw_core::rng::at(seed, u64::from(p));
         let (a, b) = ((r & 0xff) as u32, ((r >> 8) & 0xff) as u32);
         match world.cells[i] {
-            Cell::Land => (0x60 + a / 2) << 16 | (0x90 + b / 3) << 8 | (0x50 + (a ^ b) / 4),
-            Cell::Lake => (0x70 << 16) | (0xb0 + a / 8) << 8 | (0xd8 + b / 8),
+            Cell::Land | Cell::Lake => (0x60 + a / 2) << 16 | (0x90 + b / 3) << 8 | (0x50 + (a ^ b) / 4),
             _ => (0x20 + a / 8) << 16 | (0x50 + b / 4) << 8 | (0x90 + a / 3),
         }
     };
@@ -655,14 +672,13 @@ fn locations_map(
         let mean = sizes.iter().sum::<usize>() / sizes.len().max(1);
         format!("平均 {} 像素（最小 {}、最大 {}）", mean * area, min * area, max * area)
     };
-    let (l, k) = (found.land as u32, found.lakes as u32);
+    let l = found.land as u32;
     let summary = format!(
-        "種子 {seed}、{key}：陸地 {} 個地點，{}；湖 {} 個；海 {} 個，{}。切地點 {seconds:.2} 秒。",
+        "種子 {seed}、{key}：陸地 {} 個地點（含 9b 要放的湖），{}；海 {} 個，{}。切地點 {seconds:.2} 秒。",
         found.land,
         size_px(0..l),
-        found.lakes,
         found.seas,
-        size_px(l + k..l + k + found.seas as u32),
+        size_px(l..l + found.seas as u32),
     );
     let options = egui::TextureOptions {
         mipmap_mode: Some(egui::TextureFilter::Linear),
@@ -671,6 +687,121 @@ fn locations_map(
     let whole = ctx.load_texture("locations", egui::ColorImage::from_rgb([w, h], &pixels), options);
     let close = ctx.load_texture("locations_close", egui::ColorImage::from_rgb([cw, ch], &close), egui::TextureOptions::NEAREST);
     Ok((summary, whole, close))
+}
+
+/// 名稱的固定顏色（亮度 0x50～0xe0）。
+fn name_color(name: &str) -> u32 {
+    let h = name.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| eu5_rnw_core::rng::mix64(h ^ u64::from(b)));
+    let c = |shift: u32| 0x50 + ((h >> shift) & 0xff) as u32 * 0x90 / 0xff;
+    c(0) << 16 | c(8) << 8 | c(16)
+}
+
+/// 海用暗一半的顏色。
+fn dim(color: u32) -> u32 {
+    (color >> 1) & 0x7f7f7f
+}
+
+/// 步驟 9b：切地點後對應原版 ID；回傳說明、原版區域圖、新區域圖、放大的地區與省。
+fn ids_map(
+    ctx: &egui::Context,
+    seed: u64,
+    key: &str,
+    reach_px: u32,
+) -> Outcome<(String, egui::TextureHandle, egui::TextureHandle, egui::TextureHandle)> {
+    use eu5_rnw_core::land::{Cell, preset};
+
+    let params = preset(key).ok_or_else(|| format!("unknown world type {key}"))?;
+    let c = canvas(reach_px)?;
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let world = eu5_rnw_core::generate::generate(&c, seed, &params, threads)?;
+    let found = eu5_rnw_core::generate::cut_locations(&c, &world, seed)?;
+    let start = Instant::now();
+    let done = eu5_rnw_core::generate::assign_ids(&c, &world, &found)?;
+    let seconds = start.elapsed().as_secs_f64();
+
+    let (w, h) = (c.width, c.height);
+    let mut pool = vec![false; c.parents.len()];
+    for &l in &done.ids {
+        pool[l] = true;
+    }
+    let level_of = |l: usize, level: usize| c.parents[l].as_ref().map_or("", |p| p[level].as_str());
+    const LAKE: u32 = 0x9fd8f0;
+    let region = |l: usize| {
+        let color = name_color(level_of(l, 2));
+        match () {
+            _ if c.sea[l] => dim(color),
+            _ if !c.land[l] => LAKE,
+            _ => color,
+        }
+    };
+    let outside = |l: usize| if c.sea[l] { LAND_LEGEND[2].0 } else { LAND_LEGEND[3].0 };
+    let vanilla: Vec<u8> = c
+        .labels
+        .iter()
+        .flat_map(|&l| {
+            let l = usize::from(l);
+            rgb(if pool[l] { region(l) } else { outside(l) })
+        })
+        .collect();
+    let new: Vec<u8> = (0..found.part.len())
+        .flat_map(|i| {
+            let l = usize::from(done.labels[i]);
+            rgb(if found.part[i] == u32::MAX { outside(l) } else { region(l) })
+        })
+        .collect();
+
+    // 放大：陸地格子的平均位置附近 768×512 格；顏色是地區，黑線省界，淡線地點邊界。
+    let land: Vec<usize> = (0..found.part.len()).filter(|&i| done.cells[i] == Cell::Land).collect();
+    let (cx, cy) = (
+        land.iter().map(|&i| i % w).sum::<usize>() / land.len().max(1),
+        land.iter().map(|&i| i / w).sum::<usize>() / land.len().max(1),
+    );
+    let (cw, ch) = (768.min(w), 512.min(h));
+    let (x0, y0) = (cx.saturating_sub(cw / 2).min(w - cw), cy.saturating_sub(ch / 2).min(h - ch));
+    let close: Vec<u8> = (0..ch)
+        .flat_map(|y| (0..cw).map(move |x| (y0 + y) * w + x0 + x))
+        .flat_map(|i| {
+            let l = usize::from(done.labels[i]);
+            if found.part[i] == u32::MAX {
+                return rgb(outside(l));
+            }
+            let others = [i / w * w + (i + 1) % w, (i + w).min(found.part.len() - 1)].map(|n| usize::from(done.labels[n]));
+            let color = match () {
+                _ if others.iter().any(|&n| level_of(n, 4) != level_of(l, 4)) => 0x101010,
+                _ if !c.land[l] && !c.sea[l] => LAKE,
+                _ if others.iter().any(|&n| n != l) => dim(name_color(level_of(l, 3))) + 0x202020,
+                _ if c.sea[l] => dim(name_color(level_of(l, 3))),
+                _ => name_color(level_of(l, 3)),
+            };
+            rgb(color)
+        })
+        .collect();
+
+    let distinct = |level: usize| {
+        let names: std::collections::BTreeSet<&str> = done.ids.iter().map(|&l| level_of(l, level)).collect();
+        names.len()
+    };
+    let lakes = done.ids.iter().filter(|&&l| !c.land[l] && !c.sea[l]).count();
+    let summary = format!(
+        "種子 {seed}、{key}：{} 個原版地點各用一次（陸地 {}，其中湖 {lakes}；海 {}），分在 {} 個區域、{} 個地區、{} 個省。對應 ID {seconds:.2} 秒。",
+        done.ids.len(),
+        found.land,
+        found.seas,
+        distinct(2),
+        distinct(3),
+        distinct(4),
+    );
+    let options = egui::TextureOptions {
+        mipmap_mode: Some(egui::TextureFilter::Linear),
+        ..egui::TextureOptions::LINEAR
+    };
+    let image = |pixels: &[u8], size: [usize; 2]| egui::ColorImage::from_rgb(size, pixels);
+    Ok((
+        summary,
+        ctx.load_texture("ids_vanilla", image(&vanilla, [w, h]), options),
+        ctx.load_texture("ids_new", image(&new, [w, h]), options),
+        ctx.load_texture("ids_close", image(&close, [cw, ch]), egui::TextureOptions::NEAREST),
+    ))
 }
 
 /// 步驟 7a：生成範圍＝新世界＋延伸距離內、緩衝外的大西洋與太平洋，每 4 像素一格。

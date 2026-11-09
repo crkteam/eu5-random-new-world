@@ -4,7 +4,8 @@
 //! 2. 範圍邊緣 `EDGE_PX` 內一律是海，再往內 `RAMP_PX` 逐漸壓低高度，海岸會彎離邊界，
 //!    也不會貼到範圍外的舊世界（例如貼著格陵蘭的巴芬灣）。
 //! 3. 取最高的格子當陸地，數量剛好是範圍的 `land_share`（陸地比例相對整個範圍，同原專案）。
-//! 4. 太小的島變成海；被陸地包住的水：太小的填成陸地，太大的當內海，其餘是湖。
+//! 4. 太小的島變成海；被陸地包住的水：大的當內海，其餘填成陸地。
+//!    湖不在這裡做：第 9b 步把原版的湖放進它所屬省的新土地裡（擁有者選的做法）。
 //!
 //! 參數照原專案各世界類型的預設值（`old/src/rnw/settings.py`）。
 
@@ -24,8 +25,7 @@ pub struct LandParams {
     pub noise: NoiseParams,
     /// 小於這個面積（原圖像素）的島變成海。
     pub min_island_px: usize,
-    /// 被陸地包住的水：小於 `min_lake_px` 填成陸地，大於 `max_lake_px` 當內海。
-    pub min_lake_px: usize,
+    /// 被陸地包住的水：大於 `max_lake_px` 當內海，其餘填成陸地。
     pub max_lake_px: usize,
 }
 
@@ -34,7 +34,6 @@ const fn params(land_share: f64, feature_px: f64, octaves: u32, persistence: f64
         land_share,
         noise: NoiseParams { feature_px, octaves, persistence },
         min_island_px,
-        min_lake_px: 80,
         max_lake_px: 25_000,
     }
 }
@@ -61,6 +60,7 @@ pub enum Cell {
     Outside,
     Sea,
     Land,
+    /// 只在第 9b 步出現：原版的湖放進新土地。
     Lake,
 }
 
@@ -110,7 +110,7 @@ fn highest(scores: &[Option<f32>], count: usize) -> Result<Vec<bool>, String> {
     Ok(land)
 }
 
-/// 清掉小島、分出湖與內海。
+/// 清掉小島、分出內海，其餘被包住的水填成陸地。
 fn clean(land: &[bool], domain: &[bool], (width, height, step): (usize, usize, usize), params: &LandParams) -> Vec<Cell> {
     let area = step * step;
     let size = (width, height);
@@ -139,11 +139,7 @@ fn clean(land: &[bool], domain: &[bool], (width, height, step): (usize, usize, u
             } else {
                 let part = parts[i] as usize;
                 let px = sizes[part] * area;
-                match () {
-                    _ if open[part] || px > params.max_lake_px => Cell::Sea,
-                    _ if px < params.min_lake_px => Cell::Land,
-                    _ => Cell::Lake,
-                }
+                if open[part] || px > params.max_lake_px { Cell::Sea } else { Cell::Land }
             }
         })
         .collect()
@@ -216,7 +212,7 @@ mod tests {
         // 範圍是內部 7×5；外圈一格是範圍外。
         let (domain, size) = grid(&[".........", ".#######.", ".#######.", ".#######.", ".#######.", ".#######.", "........."]);
         let (land, _) = grid(&[".........", ".#.......", ".........", "...####..", "...#.##..", "...####..", "........."]);
-        let p = LandParams { min_island_px: 2, min_lake_px: 2, max_lake_px: 4, ..preset("continents").unwrap() };
+        let p = LandParams { min_island_px: 2, max_lake_px: 4, ..preset("continents").unwrap() };
         let cells = clean(&land, &domain, (size.0, size.1, 1), &p);
         let at = |x: usize, y: usize| cells[y * size.0 + x];
         assert_eq!(at(0, 0), Cell::Outside);
@@ -227,12 +223,12 @@ mod tests {
     }
 
     #[test]
-    fn enclosed_water_becomes_lake_or_inland_sea() {
+    fn enclosed_water_fills_or_becomes_inland_sea() {
         let (domain, size) = grid(&["..........", ".########.", ".########.", ".########.", ".########.", ".........."]);
         let (land, _) = grid(&["..........", ".########.", ".#..#...#.", ".#..#...#.", ".########.", ".........."]);
-        let p = LandParams { min_island_px: 1, min_lake_px: 2, max_lake_px: 5, ..preset("continents").unwrap() };
+        let p = LandParams { min_island_px: 1, max_lake_px: 5, ..preset("continents").unwrap() };
         let cells = clean(&land, &domain, (size.0, size.1, 1), &p);
-        assert_eq!(cells[2 * size.0 + 2], Cell::Lake, "4 cells: a lake");
+        assert_eq!(cells[2 * size.0 + 2], Cell::Land, "4 cells: filled");
         assert_eq!(cells[2 * size.0 + 5], Cell::Sea, "6 cells: an inland sea");
     }
 
@@ -240,7 +236,7 @@ mod tests {
     fn cut_keeps_the_edge_wet_and_the_share() {
         let (w, h, step) = (200, 100, 16);
         let domain: Vec<bool> = (0..w * h).map(|i| (i % w) >= 20 && (i % w) < 180 && i / w >= 10 && i / w < 90).collect();
-        let p = LandParams { min_island_px: 0, min_lake_px: 0, max_lake_px: usize::MAX, ..preset("continents").unwrap() };
+        let p = LandParams { min_island_px: 0, max_lake_px: usize::MAX, ..preset("continents").unwrap() };
         let cells = cut(7, &p, (w, h, step), &domain, 4).unwrap();
         let inside = domain.iter().filter(|&&d| d).count();
         let land = cells.iter().filter(|&&c| c == Cell::Land).count();

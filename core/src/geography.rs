@@ -151,6 +151,8 @@ pub struct Geography {
     pub continents: Vec<String>,
     /// 每個地點屬於 `continents` 的第幾個；`None` 是顏色表有、`definitions.txt` 沒有的地點。
     pub continent: Vec<Option<usize>>,
+    /// 每個地點的上層：大陸、次大陸、區域、地區、省（同 `LEVELS`）。
+    pub parents: Vec<Option<[String; 5]>>,
     pub kind: Vec<Kind>,
 }
 
@@ -168,6 +170,7 @@ impl Geography {
             .collect();
         let mut continents: Vec<String> = Vec::new();
         let mut continent = vec![None; locations.len()];
+        let mut parents = vec![None; locations.len()];
         for placement in placements {
             let Some(&at) = index.get(placement.key.as_str()) else {
                 return Err(format!(
@@ -175,6 +178,7 @@ impl Geography {
                     placement.key
                 ));
             };
+            parents[at] = Some(placement.parents.clone());
             let name = &placement.parents[0];
             continent[at] = Some(match continents.iter().position(|c| c == name) {
                 Some(position) => position,
@@ -196,6 +200,7 @@ impl Geography {
         Ok(Self {
             continents,
             continent,
+            parents,
             kind,
         })
     }

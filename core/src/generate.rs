@@ -8,7 +8,7 @@ use std::path::Path;
 use crate::domain::{FRAGMENT_PX, GUARD_PX, OCEANS, new_world_domain, tidy};
 use crate::geography::{Kind, read_geography};
 use crate::islands::{self, COAST_ZONE_PX, Group, ISLAND_CONTINENTS, MARGIN_PX};
-use crate::land::{Cell, LandParams, components, cut};
+use crate::land::{Cell, LandParams, cut};
 use crate::partition::split;
 use crate::rng::at;
 use crate::locations::{Label, read_location_map};
@@ -30,6 +30,8 @@ pub struct Canvas {
     /// 夠小、碰到島就跟著島走的海域。
     pub coast_zone: Vec<bool>,
     pub domain: Vec<bool>,
+    /// 每個地點的上層（同 `geography::LEVELS`）。
+    pub parents: Vec<Option<[String; 5]>>,
 }
 
 /// 讀 `map_data` 並決定生成範圍：延伸 `reach_px`、緩衝 `GUARD_PX`。
@@ -54,7 +56,7 @@ pub fn read_canvas(map_data: &Path, step: usize, reach_px: u32) -> Result<Canvas
     );
     let island_land: Vec<bool> = (0..land.len()).map(|l| land[l] && islandish[l]).collect();
     tidy(&mut labels, &mut domain, (width, height), FRAGMENT_PX.div_ceil(step * step), &island_land);
-    Ok(Canvas { width, height, step, labels, new_world, ocean, sea, land, islandish, coast_zone, domain })
+    Ok(Canvas { width, height, step, labels, new_world, ocean, sea, land, islandish, coast_zone, domain, parents: geo.parents })
 }
 
 /// 生成結果：每格的類別，以及最後的標籤（搬過的島群在新位置）。
@@ -78,17 +80,16 @@ pub fn generate(canvas: &Canvas, seed: u64, params: &LandParams, threads: usize)
     Ok(World { cells, labels, groups, moves })
 }
 
-/// 第 9 步：新世界切成地點，數量剛好是可以重用的原版地點數。
+/// 第 9a 步：新世界切成地點，數量剛好是可以重用的原版地點數。
 pub struct Locations {
-    /// 每格的地點編號（範圍外與島群是 `u32::MAX`）：陸地 `0..land`，
-    /// 之後是湖 `land..land + lakes`，再來是海。
+    /// 每格的地點編號（範圍外與島群是 `u32::MAX`）：陸地 `0..land`，海 `land..land + seas`。
     pub part: Vec<u32>,
+    /// 陸地塊數＝原版陸地加湖（湖在 9b 從陸地塊裡挑）。
     pub land: usize,
-    pub lakes: usize,
     pub seas: usize,
 }
 
-/// 範圍內可以重用的原版地點（陸地, 水域），不含島群帶走的地點。
+/// 範圍內可以重用的原版地點（陸地與湖, 海），不含島群帶走的地點。
 /// shortcut: 不能通行與不可擁有的地點也算陸地，會隨機落在新大陸上；要讓它們成為山脈或荒地時再分開。
 pub fn pools(canvas: &Canvas, world: &World) -> (Vec<usize>, Vec<usize>) {
     let mut inside = canvas.new_world.clone();
@@ -100,37 +101,60 @@ pub fn pools(canvas: &Canvas, world: &World) -> (Vec<usize>, Vec<usize>) {
             inside[l] = false;
         }
     }
-    (0..inside.len()).filter(|&l| inside[l]).partition(|&l| canvas.land[l])
+    (0..inside.len()).filter(|&l| inside[l]).partition(|&l| !canvas.sea[l])
 }
 
-/// 把陸地切成陸地地點；每個湖一個地點，其餘水域地點全給海。
+/// 陸地切成「原版陸地＋湖」那麼多塊，海切成原版海那麼多塊。
 pub fn cut_locations(canvas: &Canvas, world: &World, seed: u64) -> Result<Locations, String> {
     let size = (canvas.width, canvas.height);
-    let (land_ids, water_ids) = pools(canvas, world);
+    let (land_ids, sea_ids) = pools(canvas, world);
     let mask = |kind: Cell| -> Vec<bool> { world.cells.iter().map(|&c| c == kind).collect() };
-    let (lake, lake_sizes) = components(&mask(Cell::Lake), size);
-    let lakes = lake_sizes.len();
-    let seas = water_ids.len().checked_sub(lakes).ok_or_else(|| {
-        format!("{lakes} lakes but only {} water locations", water_ids.len())
-    })?;
     // 陸地和海互不相干，各用一條執行緒；結果與執行緒無關。
     let (land, sea) = std::thread::scope(|scope| {
-        let land = scope.spawn(|| split(&mask(Cell::Land), size, land_ids.len(), at(seed, 9)));
-        let sea = split(&mask(Cell::Sea), size, seas, at(seed, 10));
+        let land = scope.spawn(|| split(&mask(Cell::Land), size, canvas.step, land_ids.len(), at(seed, 9)));
+        let sea = split(&mask(Cell::Sea), size, canvas.step, sea_ids.len(), at(seed, 10));
         (land.join().expect("land split panicked"), sea)
     });
     let land = land.map_err(|e| format!("land: {e}"))?;
     let sea = sea.map_err(|e| format!("sea: {e}"))?;
-    let (l, k) = (land_ids.len() as u32, lakes as u32);
+    let l = land_ids.len() as u32;
     let part = (0..world.cells.len())
         .map(|i| match world.cells[i] {
-            Cell::Land => land[i],
-            Cell::Lake => l + lake[i],
-            Cell::Sea => l + k + sea[i],
+            Cell::Land | Cell::Lake => land[i],
+            Cell::Sea => l + sea[i],
             Cell::Outside => u32::MAX,
         })
         .collect();
-    Ok(Locations { part, land: land_ids.len(), lakes, seas })
+    Ok(Locations { part, land: land_ids.len(), seas: sea_ids.len() })
+}
+
+/// 第 9b 步的結果：每格最後的地點與類別（原版湖所在的塊變成 `Cell::Lake`）。
+pub struct Assigned {
+    pub labels: Vec<Label>,
+    pub cells: Vec<Cell>,
+    /// 每塊對應的原版地點（索引同 `Locations::part`）。
+    pub ids: Vec<usize>,
+}
+
+/// 給每一塊一個原版地點 ID：照原版階層由上往下分，同一省、地區、區域的地點留在一起。
+pub fn assign_ids(canvas: &Canvas, world: &World, found: &Locations) -> Result<Assigned, String> {
+    let (land_ids, sea_ids) = pools(canvas, world);
+    let lake: Vec<bool> = (0..canvas.land.len()).map(|l| !canvas.land[l] && !canvas.sea[l]).collect();
+    let ids = crate::assign::assign(canvas, &found.part, (&land_ids, &sea_ids), &lake)?;
+    let labels = (0..found.part.len())
+        .map(|i| match found.part[i] {
+            u32::MAX => world.labels[i],
+            p => ids[p as usize] as Label,
+        })
+        .collect();
+    let cells = (0..found.part.len())
+        .map(|i| match found.part[i] {
+            u32::MAX => world.cells[i],
+            p if lake[ids[p as usize]] => Cell::Lake,
+            _ => world.cells[i],
+        })
+        .collect();
+    Ok(Assigned { labels, cells, ids })
 }
 
 #[cfg(test)]
@@ -180,7 +204,7 @@ mod tests {
                 let found = cut_locations(&canvas, &world, seed).unwrap();
                 let took = started.elapsed();
                 let (land, water) = pools(&canvas, &world);
-                assert_eq!((found.land, found.lakes + found.seas), (land.len(), water.len()), "{key}");
+                assert_eq!((found.land, found.seas), (land.len(), water.len()), "{key}");
                 // 同編號相連的塊數＝地點數，表示每個地點都只有一塊。
                 let mut seen = vec![false; found.part.len()];
                 let mut pieces = 0;
@@ -201,8 +225,45 @@ mod tests {
                     }
                 }
                 assert_eq!(pieces, land.len() + water.len(), "seed {seed} {key}: a location is in pieces or missing");
-                println!("seed {seed} {key}: {} land, {} lakes, {} seas in {took:.2?}", found.land, found.lakes, found.seas);
+                let assigned = assign_ids(&canvas, &world, &found).unwrap();
+                let mut used = assigned.ids.clone();
+                used.sort_unstable();
+                let mut want: Vec<usize> = land.iter().chain(&water).copied().collect();
+                want.sort_unstable();
+                assert_eq!(used, want, "seed {seed} {key}: every vanilla location is used once");
+                // 陸地的每一層有幾個節點被分成不只一塊（島嶼會讓這個數字合理地大於 0）。
+                let split_nodes: Vec<String> = (2..5)
+                    .map(|level| {
+                        let key_of = |i: usize| { let l = usize::from(assigned.labels[i]); if canvas.sea[l] { None } else { canvas.parents[l].as_ref().map(|p| p[level].as_str()) } };
+                        let mut seen = vec![false; found.part.len()];
+                        let mut pieces: std::collections::BTreeMap<&str, usize> = Default::default();
+                        for start in 0..found.part.len() {
+                            if found.part[start] == u32::MAX || seen[start] || key_of(start).is_none() {
+                                continue;
+                            }
+                            let k = key_of(start);
+                            *pieces.entry(k.unwrap_or("")).or_default() += 1;
+                            seen[start] = true;
+                            let mut stack = vec![start];
+                            while let Some(i) = stack.pop() {
+                                for n in crate::land::neighbours(i, size) {
+                                    if !seen[n] && found.part[n] != u32::MAX && key_of(n) == k {
+                                        seen[n] = true;
+                                        stack.push(n);
+                                    }
+                                }
+                            }
+                        }
+                        format!("{}/{}", pieces.values().filter(|&&n| n > 1).count(), pieces.len())
+                    })
+                    .collect();
+                let lakes = assigned.cells.iter().filter(|&&c| c == Cell::Lake).count();
+                println!("  land regions/areas/provinces in pieces: {}; lake cells {lakes}", split_nodes.join(", "));
+                println!("seed {seed} {key}: {} land, {} seas in {took:.2?}", found.land, found.seas);
             }
         }
     }
 }
+
+
+

@@ -116,6 +116,89 @@ pub fn decode(data: &[u8], size: usize) -> Result<Vec<u8>, Fault> {
     Ok(out)
 }
 
+const MIN_REFERENCE: usize = 5;
+const LITERALS_AT_END: usize = 9;
+const SHORT_REFERENCE: usize = 15;
+const RUN_DISTANCE: usize = 8;
+const MIN_RUN: usize = 32;
+pub 
+fn push_length(out: &mut Vec<u8>, mut value: usize) {
+    while value > 0x7F {
+        out.push(0x80 | (value & 0x7F) as u8);
+        value >>= 7;
+    }
+    out.push(value as u8);
+}
+
+fn push_literals(out: &mut Vec<u8>, chunk: &[u8]) {
+    if chunk.len() < SHORT_LENGTH {
+        out.push(chunk.len() as u8);
+    } else {
+        out.push(0);
+        push_length(out, chunk.len() - SHORT_LENGTH);
+    }
+    out.extend_from_slice(chunk);
+}
+
+/// Spans `[start, end)` where every byte repeats the byte eight positions earlier and the
+/// run is at least `MIN_RUN` long.
+fn runs(raw: &[u8]) -> Vec<(usize, usize)> {
+    if raw.len() <= RUN_DISTANCE {
+        return Vec::new();
+    }
+    let mut spans = Vec::new();
+    let mut start: Option<usize> = None;
+    for at in 0..=raw.len() - RUN_DISTANCE {
+        let same = at < raw.len() - RUN_DISTANCE && raw[at + RUN_DISTANCE] == raw[at];
+        match (same, start) {
+            (true, None) => start = Some(at),
+            (false, Some(first)) => {
+                if at - first >= MIN_RUN {
+                    spans.push((first + RUN_DISTANCE, at + RUN_DISTANCE));
+                }
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    spans
+}
+
+/// 壓縮：重複段落（每個位元組等於 8 個之前的）用往前 8 的參照，其餘直接存（移植自原專案 `old/native/src/tiles.rs`）。
+pub fn encode(raw: &[u8]) -> Vec<u8> {
+    let limit = raw.len() as i64 - LITERALS_AT_END as i64;
+    let mut out = vec![FORMAT << 4 | MIN_REFERENCE as u8];
+    let mut position = 0_usize;
+    for (run_start, run_end) in runs(raw) {
+        let start = run_start.max(position);
+        let end = (run_end as i64).min(limit);
+        if end - (start as i64) < MIN_REFERENCE as i64 + 1 {
+            continue;
+        }
+        let end = end as usize;
+        let mut shift = 0;
+        if start > position {
+            push_literals(&mut out, &raw[position..start]);
+            shift = 2;
+        }
+        let field = (RUN_DISTANCE >> shift) as u8;
+        let length = end - start;
+        let extra = MIN_REFERENCE - 1;
+        if length - extra <= SHORT_REFERENCE {
+            out.push((field & 3) << 6 | 0x10 | (length - extra) as u8);
+            out.push(field >> 2);
+        } else {
+            out.push((field & 3) << 6 | 0x10);
+            out.push(field >> 2);
+            push_length(&mut out, length - extra - SHORT_LENGTH);
+        }
+        position = end;
+    }
+    let tail = &raw[position..];
+    push_literals(&mut out, tail);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -132,6 +215,19 @@ mod tests {
                 expected: 6
             })
         );
+    }
+
+    #[test]
+    fn encoded_streams_decode_to_the_input() {
+        let mut raw: Vec<u8> = (0..300).map(|v| (v * 7 % 251) as u8).collect();
+        raw.extend(std::iter::repeat_n(9_u8, 400));
+        raw.extend((0..50).map(|v| v as u8));
+        raw.extend([1, 2, 3, 4, 5, 6, 7, 8].repeat(40));
+        for cut in [1, 8, 15, 16, 17, 40, raw.len()] {
+            let part = &raw[..cut];
+            assert_eq!(decode(&encode(part), part.len()).unwrap(), part, "length {cut}");
+        }
+        assert!(encode(&raw).len() < raw.len() / 2, "runs are compressed");
     }
 
     #[test]

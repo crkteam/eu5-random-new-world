@@ -123,6 +123,8 @@ struct App {
     relief_check: Task<(String, egui::TextureHandle)>,
     /// 步驟 11b：新地圖的高度。
     new_relief_check: Task<(String, egui::TextureHandle, egui::TextureHandle)>,
+    /// 步驟 11c：寫成新的高度貼花並讀回。
+    layers_check: Task<(String, egui::TextureHandle)>,
     /// 產生器頁「生成」的結果；`Idle` 時中央顯示原版地圖。
     generated: Task<(String, egui::TextureHandle)>,
     /// 中央的原版地圖（步驟 4），啟動時開始讀。
@@ -155,6 +157,7 @@ impl App {
             full_check: Task::Idle,
             relief_check: Task::Idle,
             new_relief_check: Task::Idle,
+            layers_check: Task::Idle,
             generated: Task::Idle,
             vanilla,
         }
@@ -342,6 +345,21 @@ impl App {
             wide_image(ui, whole);
             ui.add_space(4.0);
             wide_image(ui, close);
+        });
+        ui.add_space(12.0);
+
+        ui.strong("11c. 寫成新的高度貼花");
+        ui.weak(format!(
+            "接著 11b（{name}、種子 {}），把新高度打包成遊戲讀的 .bin／.info（只在記憶體裡，還不寫進 mod）：\
+             內容沒變的小塊直接沿用原版位元組，有變的重新壓縮，縮小層全部重建。每塊寫好後立刻解開，\
+             必須和寫進去的高度完全相同，否則失敗。圖是改最多的那塊貼花、從新檔案解開的高度（每 4 個貼花像素一點）。",
+            self.seed
+        ));
+        let (seed, reach) = (self.seed, self.reach_px);
+        self.layers_check.button(ui, move |ctx| layers_map(ctx, seed, key, reach));
+        self.layers_check.show(ui, |ui, (summary, texture)| {
+            ui.label(summary);
+            wide_image(ui, texture);
         });
     }
 
@@ -838,7 +856,7 @@ fn new_relief_map(
         return Err(format!("heights {vw}x{vh} and the canvas {}x{} do not line up", c.width, c.height));
     }
     let start = Instant::now();
-    let relief = Relief::new(&c, &done, &labels, &vanilla, seed);
+    let relief = Relief::new(&c, &world, &done, &labels, &vanilla, seed);
     let seconds = start.elapsed().as_secs_f64();
     let source = source_cell(&world, (c.width, c.height));
     // 地點像素 (x, y) 的高度：生成的照新模型，其餘取原版（搬過的島群取來源格）。
@@ -882,6 +900,51 @@ fn new_relief_map(
         ctx.load_texture("new_relief", egui::ColorImage::from_rgb([w, h], &whole), egui::TextureOptions::LINEAR),
         ctx.load_texture("new_relief_close", egui::ColorImage::from_rgb([cw, ch], &close), egui::TextureOptions::NEAREST),
     ))
+}
+
+/// 步驟 11c：打包新的高度貼花，逐塊讀回比對；回傳說明與改最多那塊的高度圖。
+fn layers_map(ctx: &egui::Context, seed: u64, key: &str, reach_px: u32) -> Outcome<(String, egui::TextureHandle)> {
+    use eu5_rnw_core::generate::{assign_ids, cut_locations, generate};
+    use eu5_rnw_core::land::preset;
+    use eu5_rnw_core::relief::{Relief, height_layers};
+    use eu5_rnw_core::terrain::decode_level0;
+
+    let params = preset(key).ok_or_else(|| format!("unknown world type {key}"))?;
+    let game = eu5_rnw_core::game::choose_game(None).map_err(|e| e.to_string())?;
+    let c = canvas(reach_px)?;
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let world = generate(&c, seed, &params, threads)?;
+    let found = cut_locations(&c, &world, seed)?;
+    let done = assign_ids(&c, &world, &found)?;
+    let labels = eu5_rnw_core::validate::full_map(&c, &world, &found, &done);
+    let (_, _, vanilla) = eu5_rnw_core::terrain::sample_heights(&game.directory, STEP, threads).map_err(|e| e.to_string())?;
+    let relief = Relief::new(&c, &world, &done, &labels, &vanilla, seed);
+    let start = Instant::now();
+    let mut lines = Vec::new();
+    let mut most: Option<(usize, usize, Vec<u16>)> = None;
+    height_layers(&game.directory, &c, &world, &relief, threads, |out| {
+        let back = decode_level0(&out.layer, threads)?;
+        if back != out.heights {
+            return Err(format!("{} does not read back as written", out.decal.name));
+        }
+        lines.push(format!("{}：重新壓縮 {} 個小塊、{:.1} MB", out.decal.name, out.changed_tiles, out.layer.bin.len() as f64 / 1048576.0));
+        if most.as_ref().is_none_or(|m| out.changed_tiles > m.0) {
+            let (w, h) = (out.decal.width / 4, out.decal.height / 4);
+            let small = (0..h).flat_map(|y| (0..w).map(move |x| (x, y))).map(|(x, y)| back[y * 4 * out.decal.width + x * 4]).collect();
+            most = Some((out.changed_tiles, w, small));
+        }
+        Ok(())
+    })?;
+    let seconds = start.elapsed().as_secs_f64();
+    let (_, w, small) = most.ok_or("no height decal changed")?;
+    let h = small.len() / w;
+    let pixels: Vec<u8> = small.iter().flat_map(|&v| height_color(v)).collect();
+    let summary = format!(
+        "種子 {seed}、{key}：{} 塊貼花有改變，全部讀回與寫入相同；打包加讀回 {seconds:.2} 秒。\n{}",
+        lines.len(),
+        lines.join("\n")
+    );
+    Ok((summary, ctx.load_texture("layers", egui::ColorImage::from_rgb([w, h], &pixels), egui::TextureOptions::LINEAR)))
 }
 
 /// 步驟 11a：全世界的高度縮圖，並和原版地點的陸地／海比對。

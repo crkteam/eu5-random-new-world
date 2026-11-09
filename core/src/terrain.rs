@@ -126,17 +126,42 @@ pub fn parse_info(text: &str, path: &Path) -> Result<LayerInfo> {
     Ok(LayerInfo { width, height, bytes, spans })
 }
 
-/// 讀一塊貼花的高度（第 0 層），北邊在上，`threads` 條執行緒依小塊列分工。
-pub fn read_height(game: &Path, decal: &Decal, threads: usize) -> Result<Vec<u16>> {
+/// 一個貼花圖層：`.info` 的內容與 `.bin` 的位元組。
+pub struct Layer {
+    pub info: LayerInfo,
+    pub bin: Vec<u8>,
+}
+
+/// 讀一塊貼花的原版高度層檔案。
+pub fn read_height_layer(game: &Path, decal: &Decal) -> Result<Layer> {
     let (info_path, bin_path) = height_paths(game, decal);
-    let LayerInfo { width, height, bytes, spans } = parse_info(&read_text(&info_path)?, &info_path)?;
-    if (width, height, bytes) != (decal.width, decal.height, 2) {
-        return Err(Error::format(&info_path, format!("{width}x{height}x{bytes} does not match the decal cache")));
+    let info = parse_info(&read_text(&info_path)?, &info_path)?;
+    if (info.width, info.height, info.bytes) != (decal.width, decal.height, 2) {
+        return Err(Error::format(
+            &info_path,
+            format!("{}x{}x{} does not match the decal cache", info.width, info.height, info.bytes),
+        ));
     }
-    let data = std::fs::read(&bin_path).map_err(|e| Error::io(&bin_path, e))?;
+    let bin = std::fs::read(&bin_path).map_err(|e| Error::io(&bin_path, e))?;
+    Ok(Layer { info, bin })
+}
+
+/// 讀一塊貼花的高度（第 0 層），北邊在上。
+pub fn read_height(game: &Path, decal: &Decal, threads: usize) -> Result<Vec<u16>> {
+    let layer = read_height_layer(game, decal)?;
+    decode_level0(&layer, threads).map_err(|message| Error::format(&height_paths(game, decal).1, message))
+}
+
+/// 解開一層的第 0 層（2 位元組），北邊在上；`threads` 條執行緒依小塊列分工，結果與執行緒數無關。
+pub fn decode_level0(layer: &Layer, threads: usize) -> std::result::Result<Vec<u16>, String> {
+    let LayerInfo { width, height, bytes, ref spans } = layer.info;
+    if bytes != 2 {
+        return Err(format!("{bytes}-byte samples are not heights"));
+    }
+    let data = &layer.bin;
     let (down, across) = (height.div_ceil(TILE), width.div_ceil(TILE));
     if spans.len() < down * across {
-        return Err(Error::format(&info_path, format!("{} tiles listed, level 0 needs {}", spans.len(), down * across)));
+        return Err(format!("{} tiles listed, level 0 needs {}", spans.len(), down * across));
     }
     let mut south_up = vec![0u16; width * height];
     let per = down.div_ceil(threads.max(1));
@@ -145,7 +170,6 @@ pub fn read_height(game: &Path, decal: &Decal, threads: usize) -> Result<Vec<u16
             .chunks_mut(TILE * width * per)
             .enumerate()
             .map(|(worker, chunk)| {
-                let (data, spans) = (&data, &spans);
                 scope.spawn(move || {
                     for (r, rows) in chunk.chunks_mut(TILE * width).enumerate() {
                         let row_tile = worker * per + r;
@@ -171,14 +195,92 @@ pub fn read_height(game: &Path, decal: &Decal, threads: usize) -> Result<Vec<u16
         workers.into_iter().map(|w| w.join().expect("tile worker panicked")).collect()
     });
     if let Some(Err(message)) = faults.into_iter().find(|f| f.is_err()) {
-        return Err(Error::format(&bin_path, message));
+        return Err(message);
     }
-    // 檔案裡南邊在上，翻成北邊在上。
-    let mut north_up = vec![0u16; width * height];
-    for (y, row) in south_up.chunks_exact(width).enumerate() {
-        north_up[(height - 1 - y) * width..(height - y) * width].copy_from_slice(row);
+    Ok(flip(&south_up, width, height))
+}
+
+/// 上下翻轉（南邊在上 ↔ 北邊在上）。
+fn flip(samples: &[u16], width: usize, height: usize) -> Vec<u16> {
+    let mut out = vec![0u16; samples.len()];
+    for (y, row) in samples.chunks_exact(width).enumerate() {
+        out[(height - 1 - y) * width..(height - y) * width].copy_from_slice(row);
     }
-    Ok(north_up)
+    out
+}
+
+/// 一個小塊的原始位元組（132×132，四周 2 像素取自鄰居，影像邊緣重複邊上的值）。
+fn tile_bytes(samples: &[u16], (rows, columns): (usize, usize), row_tile: usize, column_tile: usize) -> Vec<u8> {
+    let mut raw = Vec::with_capacity(SIDE * SIDE * 2);
+    for i in 0..SIDE {
+        let y = (row_tile * TILE + i).saturating_sub(BORDER).min(rows - 1);
+        for j in 0..SIDE {
+            let x = (column_tile * TILE + j).saturating_sub(BORDER).min(columns - 1);
+            raw.extend_from_slice(&samples[y * columns + x].to_le_bytes());
+        }
+    }
+    raw
+}
+
+/// 一層的每個縮小層：(列, 欄) 與南邊在上的值；每層取上一層的奇數像素，直到一個小塊。
+fn levels(north_up: &[u16], (width, height): (usize, usize)) -> Vec<((usize, usize), Vec<u16>)> {
+    let mut out = vec![((height, width), flip(north_up, width, height))];
+    loop {
+        let ((rows, columns), last) = out.last().expect("level 0");
+        if *rows <= TILE && *columns <= TILE {
+            return out;
+        }
+        let (rows, columns) = (*rows, *columns);
+        let (next_rows, next_columns) = (rows / 2, columns / 2);
+        let next: Vec<u16> = (0..next_rows)
+            .flat_map(|i| (0..next_columns).map(move |j| (i, j)))
+            .map(|(i, j)| last[(2 * i + 1) * columns + 2 * j + 1])
+            .collect();
+        out.push(((next_rows, next_columns), next));
+    }
+}
+
+/// 把北邊在上的高度打包成一層（第 0 層加上一層層縮小）。
+/// 給了 `vanilla`（原版的層與它解開的第 0 層），第 0 層裡內容（含邊框）沒變的小塊直接沿用原版位元組。
+/// 回傳新的層與重新壓縮的第 0 層小塊數。
+pub fn pack(north_up: &[u16], (width, height): (usize, usize), vanilla: Option<(&Layer, &[u16])>) -> (Layer, usize) {
+    let old = vanilla.map(|(layer, samples)| (layer, flip(samples, width, height)));
+    let (mut bin, mut spans, mut changed) = (Vec::new(), Vec::new(), 0);
+    for (index, ((rows, columns), samples)) in levels(north_up, (width, height)).iter().enumerate() {
+        let across = columns.div_ceil(TILE);
+        for r in 0..rows.div_ceil(TILE) {
+            for c in 0..across {
+                let raw = tile_bytes(samples, (*rows, *columns), r, c);
+                let reused = match &old {
+                    Some((layer, before)) if index == 0 && tile_bytes(before, (*rows, *columns), r, c) == raw => {
+                        let (offset, size) = layer.info.spans[r * across + c];
+                        Some(layer.bin[offset..offset + size].to_vec())
+                    }
+                    _ => None,
+                };
+                let packed = reused.unwrap_or_else(|| {
+                    changed += usize::from(index == 0);
+                    lzav::encode(&raw)
+                });
+                spans.push((bin.len(), packed.len()));
+                bin.extend_from_slice(&packed);
+            }
+        }
+    }
+    (Layer { info: LayerInfo { width, height, bytes: 2, spans }, bin }, changed)
+}
+
+/// `.info` 的文字，格式同原版。
+pub fn info_text(info: &LayerInfo) -> String {
+    let tiles: Vec<String> =
+        info.spans.iter().map(|(offset, size)| format!("{{\n\t\toffset={offset}\n\t\tsize={size}\n\t}}")).collect();
+    format!(
+        "source_resolution={{ {} {} }}\nnum_channels=1\nbytes_per_channel={}\nempty_value={{ 0 0 0 0 }}\nlzav=yes\ntile_infos={{ {} }}\n",
+        info.width,
+        info.height,
+        info.bytes,
+        tiles.join(" ")
+    )
 }
 
 /// 全世界的高度縮圖：每 `step` 個地點像素取一點（貼花像素是地點像素的 2 倍）。
@@ -210,6 +312,27 @@ mod tests {
         let info = parse_info(text, Path::new("x.info")).unwrap();
         assert_eq!(info, LayerInfo { width: 8192, height: 4096, bytes: 2, spans: vec![(0, 17), (17, 5)] });
         assert!(parse_info("num_channels=3", Path::new("x.info")).is_err());
+    }
+
+    #[test]
+    fn packed_layers_decode_and_reuse_untouched_tiles() {
+        // 300×200：3×2 個小塊，加縮小層 150×100（2 塊）與 75×50（1 塊）。
+        let (w, h) = (300, 200);
+        let before: Vec<u16> = (0..w * h).map(|i| ((i % w) * 7 + (i / w) * 13) as u16).collect();
+        let (layer, changed) = pack(&before, (w, h), None);
+        assert_eq!(changed, 6);
+        assert_eq!(layer.info.spans.len(), 6 + 2 + 1);
+        assert_eq!(decode_level0(&layer, 3).unwrap(), before);
+        let text = info_text(&layer.info);
+        assert_eq!(parse_info(&text, Path::new("x.info")).unwrap(), layer.info, "the .info text reads back");
+        // 只改北邊左上角一個像素：南邊在上存，所以落在最後一列小塊的第一塊，邊框不跨到別塊。
+        let mut after = before.clone();
+        after[0] = 9;
+        let (again, changed) = pack(&after, (w, h), Some((&layer, &before)));
+        assert_eq!(changed, 1);
+        assert_eq!(decode_level0(&again, 1).unwrap(), after);
+        let (s0, s1) = (layer.info.spans[0], again.info.spans[0]);
+        assert_eq!(layer.bin[s0.0..s0.0 + s0.1], again.bin[s1.0..s1.0 + s1.1], "an untouched tile keeps its bytes");
     }
 
     #[test]

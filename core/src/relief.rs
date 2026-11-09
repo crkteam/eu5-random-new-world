@@ -7,9 +7,15 @@
 //!   在格子上做模糊後雙線性取樣，地點交界才不會有台階；再加上隨高度變大的細噪聲。
 //!
 //! 距離在完整地點圖上算（每個地點像素 2 個貼花像素），最多 `REACH` 個地點像素。
+//!
+//! 第 11c 步：`height_layers` 把新高度寫進有改變的高度貼花（沒改到的小塊沿用原版位元組）。
+
+use std::collections::HashMap;
+use std::path::Path;
 
 use crate::generate::{Assigned, Canvas, World};
 use crate::locations::Label;
+use crate::terrain::{Decal, Layer, decode_level0, pack, read_decals, read_height, read_height_layer};
 use crate::noise::{NoiseParams, fractal};
 use crate::rng::at;
 
@@ -22,6 +28,8 @@ pub const SHORE: f64 = 5708.0;
 pub const RAMP: f64 = 60.0;
 /// 原版沒有可用高度的地點（太小、沒落在格子上）用平原的平均高度。
 pub const FLATLAND: f64 = 6843.0;
+/// 重算範圍往外延伸到範圍外水域的寬度（地點像素）：原版大陸棚 8 個貼花像素的兩倍。
+pub const SHELF_SPREAD: usize = 8;
 /// 距離最多算到幾個地點像素（`RAMP` 的一半再多一點）。
 pub const REACH: u8 = 40;
 /// 內陸高度在格子上模糊的半徑（格），兩次方框模糊。
@@ -48,7 +56,10 @@ const WATER: u8 = 128;
 
 impl Relief {
     /// `new` 是第 10 步的完整地點圖；`vanilla` 是原版高度在格子上的取樣（`terrain::sample_heights(step)`）。
-    pub fn new(canvas: &Canvas, done: &Assigned, new: &[Label], vanilla: &[u16], seed: u64) -> Self {
+    ///
+    /// 要重算高度的像素：新地點是重新分配的，或原本的地點被重新分配或搬走（邊界格子裡換成鄰近地點的零星像素，
+    /// 不重算就會在新海裡留下原版海岸的陸地高度）；搬過去的島群所在的格子除外，那裡沿用島群的原版高度。
+    pub fn new(canvas: &Canvas, world: &World, done: &Assigned, new: &[Label], vanilla: &[u16], seed: u64) -> Self {
         let (cw, ch, step) = (canvas.width, canvas.height, canvas.step);
         // 每個原版地點在格子上的平均高度（只算陸地高度）。
         let mut sum = vec![(0f64, 0u32); canvas.parents.len()];
@@ -66,12 +77,33 @@ impl Relief {
 
         let map = &canvas.vanilla;
         let (w, h) = (map.width, map.height);
-        let mut generated = vec![false; canvas.parents.len()];
+        let mut changed = vec![false; canvas.parents.len()];
         for &l in &done.ids {
-            generated[l] = true;
+            changed[l] = true;
         }
+        let mut island = vec![false; done.cells.len()];
+        for (group, &shift) in world.groups.iter().zip(&world.moves) {
+            if shift == (0, 0) {
+                continue;
+            }
+            for &l in &group.locations {
+                changed[l] = true;
+            }
+            for &c in &group.cells {
+                let y = (c / cw) as isize + shift.0;
+                let x = ((c % cw) as isize + shift.1).rem_euclid(cw as isize);
+                island[y as usize * cw + x as usize] = true;
+            }
+        }
+        let cell_of = |i: usize| (i / w / step).min(ch - 1) * cw + (i % w / step).min(cw - 1);
+        let mut redo: Vec<bool> = (0..new.len())
+            .map(|i| !island[cell_of(i)] && (changed[usize::from(new[i])] || changed[usize::from(map.labels[i])]))
+            .collect();
         let wet: Vec<bool> = (0..canvas.parents.len()).map(|l| !canvas.land[l]).collect();
-        let coast = coast_distance(new, (w, h), &generated, &wet);
+        // 範圍外緊鄰的水也重算：原版靠舊海岸的淺水大陸棚（例如楚科奇海貼著美洲北極海岸那圈），
+        // 舊陸地變成海以後會在海中央留下一圈舊海岸線。
+        spread_into_water(&mut redo, (w, h), SHELF_SPREAD, |i| wet[usize::from(new[i])] && !island[cell_of(i)]);
+        let coast = coast_distance(new, (w, h), &redo, &wet);
         Relief { width: w, height: h, coast, base, grid: (cw, ch, step), seed }
     }
 
@@ -166,7 +198,26 @@ fn blur(values: &[f32], land: &[bool], (w, h): (usize, usize)) -> Vec<f32> {
     value
 }
 
-/// 生成區的每個地點像素離海岸幾像素（見 `Relief::coast`）。岸線＝上下左右有不同陸水的像素，
+/// 把 `mask` 往上下左右擴 `rounds` 圈，只擴進 `allowed` 的像素；x 方向左右相接。
+fn spread_into_water(mask: &mut [bool], (w, h): (usize, usize), rounds: usize, allowed: impl Fn(usize) -> bool) {
+    let mut frontier: Vec<usize> = (0..mask.len()).filter(|&i| mask[i]).collect();
+    for _ in 0..rounds {
+        let mut next = Vec::new();
+        for &i in &frontier {
+            let (x, y) = (i % w, i / w);
+            let near = [Some(y * w + (x + w - 1) % w), Some(y * w + (x + 1) % w), (y > 0).then(|| i - w), (y + 1 < h).then(|| i + w)];
+            for n in near.into_iter().flatten() {
+                if !mask[n] && allowed(n) {
+                    mask[n] = true;
+                    next.push(n);
+                }
+            }
+        }
+        frontier = next;
+    }
+}
+
+/// `generated` 像素離海岸幾像素（見 `Relief::coast`）。岸線＝上下左右有不同陸水的像素，
 /// 從岸線往同一邊一圈圈擴（奇數圈也走斜角，近似圓形），最多 `REACH` 圈。
 fn coast_distance(labels: &[Label], (w, h): (usize, usize), generated: &[bool], wet: &[bool]) -> Vec<u8> {
     let is_wet = |i: usize| wet[usize::from(labels[i])];
@@ -177,7 +228,7 @@ fn coast_distance(labels: &[Label], (w, h): (usize, usize), generated: &[bool], 
     let mut out = vec![0u8; labels.len()];
     let mut frontier = Vec::new();
     for i in 0..labels.len() {
-        if !generated[usize::from(labels[i])] {
+        if !generated[i] {
             continue;
         }
         let side = is_wet(i);
@@ -198,7 +249,7 @@ fn coast_distance(labels: &[Label], (w, h): (usize, usize), generated: &[bool], 
                     continue;
                 }
                 let n = ny as usize * w + (x + ox).rem_euclid(w as isize) as usize;
-                if out[n] == 0 && generated[usize::from(labels[n])] && is_wet(n) == side {
+                if out[n] == 0 && generated[n] && is_wet(n) == side {
                     out[n] = if side { WATER + round } else { round };
                     next.push(n);
                 }
@@ -208,7 +259,7 @@ fn coast_distance(labels: &[Label], (w, h): (usize, usize), generated: &[bool], 
     }
     // 超過 `REACH` 的生成像素也標成最遠。
     for i in 0..labels.len() {
-        if out[i] == 0 && generated[usize::from(labels[i])] {
+        if out[i] == 0 && generated[i] {
             out[i] = if is_wet(i) { WATER + REACH } else { REACH };
         }
     }
@@ -228,6 +279,104 @@ pub fn source_cell(world: &World, (w, _): (usize, usize)) -> Vec<Option<usize>> 
     out
 }
 
+/// 第 11c 步的一塊貼花：新的高度層、重新壓縮的第 0 層小塊數、新的高度（北邊在上）。
+pub struct DecalLayer {
+    pub decal: Decal,
+    pub layer: Layer,
+    pub changed_tiles: usize,
+    pub heights: Vec<u16>,
+}
+
+/// 逐塊產生有改變的高度貼花，每塊交給 `each`（一次只留一塊在記憶體）。
+/// 生成的地點像素照 `relief`；搬過的島群取來源的原版高度（可能在別塊貼花）；其餘保留原版。
+pub fn height_layers(
+    game: &Path,
+    canvas: &Canvas,
+    world: &World,
+    relief: &Relief,
+    threads: usize,
+    mut each: impl FnMut(DecalLayer) -> std::result::Result<(), String>,
+) -> std::result::Result<(), String> {
+    let (_, decals) = read_decals(game).map_err(|e| e.to_string())?;
+    let (cw, step) = (canvas.width, canvas.step);
+    // 每格若是搬過的島群的目的地：平移（貼花像素，南北, 東西）。
+    let mut shift: Vec<Option<(isize, isize)>> = vec![None; world.cells.len()];
+    for (group, &(dy, dx)) in world.groups.iter().zip(&world.moves) {
+        if (dy, dx) == (0, 0) {
+            continue;
+        }
+        for &c in &group.cells {
+            let y = (c / cw) as isize + dy;
+            let x = ((c % cw) as isize + dx).rem_euclid(cw as isize);
+            shift[y as usize * cw + x as usize] = Some((dy * (2 * step) as isize, dx * (2 * step) as isize));
+        }
+    }
+    let world_width = 2 * relief.width;
+    let mut others: HashMap<usize, Vec<u16>> = HashMap::new();
+    for (index, decal) in decals.iter().enumerate() {
+        let touched = (decal.top / 2..(decal.top + decal.height) / 2).any(|y| {
+            (decal.left / 2..(decal.left + decal.width) / 2)
+                .any(|x| relief.generated(x, y) || shift[(y / step) * cw + x / step].is_some())
+        });
+        if !touched {
+            continue;
+        }
+        let layer = read_height_layer(game, decal).map_err(|e| e.to_string())?;
+        let vanilla = decode_level0(&layer, threads).map_err(|e| format!("{}: {e}", decal.name))?;
+        let mut heights = vanilla.clone();
+        // 島群來源可能在別塊貼花：先找出需要哪些，讀進來。
+        let mut sources = Vec::new();
+        for y in 0..decal.height {
+            for x in 0..decal.width {
+                let (gx, gy) = (decal.left + x, decal.top + y);
+                if relief.generated(gx / 2, gy / 2) {
+                    continue;
+                }
+                if let Some((dy, dx)) = shift[(gy / 2 / step) * cw + gx / 2 / step] {
+                    let sx = (gx as isize - dx).rem_euclid(world_width as isize) as usize;
+                    let sy = (gy as isize - dy) as usize;
+                    sources.push((y * decal.width + x, sx, sy));
+                }
+            }
+        }
+        for &(_, sx, sy) in &sources {
+            let owner = decals.iter().position(|d| (d.left..d.left + d.width).contains(&sx) && (d.top..d.top + d.height).contains(&sy));
+            let owner = owner.ok_or_else(|| format!("island source {sx},{sy} is in no decal"))?;
+            if owner != index && !others.contains_key(&owner) {
+                others.insert(owner, read_height(game, &decals[owner], threads).map_err(|e| e.to_string())?);
+            }
+        }
+        for &(at, sx, sy) in &sources {
+            let d = decals.iter().position(|d| (d.left..d.left + d.width).contains(&sx) && (d.top..d.top + d.height).contains(&sy)).expect("checked");
+            let from = if d == index { &vanilla } else { &others[&d] };
+            heights[at] = from[(sy - decals[d].top) * decals[d].width + sx - decals[d].left];
+        }
+        // 生成的像素，依列分給各執行緒。
+        let per = decal.height.div_ceil(threads.max(1));
+        std::thread::scope(|scope| {
+            for (worker, rows) in heights.chunks_mut(per * decal.width).enumerate() {
+                scope.spawn(move || {
+                    for (r, row) in rows.chunks_mut(decal.width).enumerate() {
+                        let gy = decal.top + worker * per + r;
+                        for (x, value) in row.iter_mut().enumerate() {
+                            let gx = decal.left + x;
+                            if relief.generated(gx / 2, gy / 2) {
+                                *value = relief.height_at(gx, gy).round().clamp(0.0, f64::from(u16::MAX)) as u16;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        if heights == vanilla {
+            continue;
+        }
+        let (layer, changed_tiles) = pack(&heights, (decal.width, decal.height), Some((&layer, &vanilla)));
+        each(DecalLayer { decal: decal.clone(), layer, changed_tiles, heights })?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -244,12 +393,21 @@ mod tests {
     fn coast_distance_counts_from_the_shore_on_both_sides() {
         // 一列：標籤 0 是陸、1 是水；5 個陸 + 5 個水，全是生成的。
         let labels: Vec<Label> = (0..10).map(|x| if x < 5 { 0 } else { 1 }).collect();
-        let d = coast_distance(&labels, (10, 1), &[true, true], &[false, true]);
+        let d = coast_distance(&labels, (10, 1), &[true; 10], &[false, true]);
         // 左右相接：最左的陸地也挨著最右的水。
         assert_eq!(d[..5], [1, 2, 3, 2, 1]);
         assert_eq!(d[5..], [WATER + 1, WATER + 2, WATER + 3, WATER + 2, WATER + 1]);
-        let none = coast_distance(&labels, (10, 1), &[false, false], &[false, true]);
+        let none = coast_distance(&labels, (10, 1), &[false; 10], &[false, true]);
         assert!(none.iter().all(|&c| c == 0), "nothing generated, nothing measured");
+    }
+
+    #[test]
+    fn spreading_stays_in_water_and_stops() {
+        let mut mask = vec![false; 8];
+        mask[0] = true;
+        // 像素 3 是陸地；最右邊經由左右相接也碰到像素 0。
+        spread_into_water(&mut mask, (8, 1), 2, |i| i != 3);
+        assert_eq!(mask, [true, true, true, false, false, false, true, true]);
     }
 
     #[test]
@@ -258,5 +416,47 @@ mod tests {
         let land = [true, true, false, false];
         let out = blur(&values, &land, (4, 1));
         assert!(out.iter().all(|&v| (v - 10.0).abs() < 1e-4), "{out:?}");
+    }
+
+    /// 需要本機安裝 EU5：新的高度貼花讀回來和寫進去的一樣，`.info` 也讀得回來。
+    #[test]
+    #[ignore = "needs an installed EU5"]
+    fn height_layers_read_back() {
+        use crate::generate::{assign_ids, cut_locations, generate, read_canvas};
+        use crate::terrain::{info_text, parse_info, sample_heights};
+        let game = crate::game::choose_game(None).unwrap();
+        let canvas = read_canvas(&game.map_data(), 4, crate::domain::REACH_PX).unwrap();
+        let seed = 42;
+        let world = generate(&canvas, seed, &crate::land::PRESETS[0].1, 8).unwrap();
+        let found = cut_locations(&canvas, &world, seed).unwrap();
+        let done = assign_ids(&canvas, &world, &found).unwrap();
+        let labels = crate::validate::full_map(&canvas, &world, &found, &done);
+        let (_, _, vanilla) = sample_heights(&game.directory, 4, 8).unwrap();
+        let relief = Relief::new(&canvas, &world, &done, &labels, &vanilla, seed);
+        let started = std::time::Instant::now();
+        let mut count = 0;
+        height_layers(&game.directory, &canvas, &world, &relief, 8, |out| {
+            let back = decode_level0(&out.layer, 8)?;
+            assert_eq!(back, out.heights, "{} reads back", out.decal.name);
+            // 重算過的像素：水的地點不能有陸地高度，陸地不能有海底高度（原版海岸殘留就會被抓到）。
+            let mut wrong = 0;
+            for (i, &v) in back.iter().enumerate() {
+                let (gx, gy) = (out.decal.left + i % out.decal.width, out.decal.top + i / out.decal.width);
+                if !relief.generated(gx / 2, gy / 2) {
+                    continue;
+                }
+                let dry = canvas.land[usize::from(labels[gy / 2 * relief.width + gx / 2])];
+                wrong += usize::from(if dry { v < 3000 } else { v > 5500 });
+            }
+            assert_eq!(wrong, 0, "{}: heights disagree with land and water", out.decal.name);
+            let info = parse_info(&info_text(&out.layer.info), Path::new("x.info")).map_err(|e| e.to_string())?;
+            assert_eq!(info, out.layer.info);
+            println!("{}: {} level-0 tiles rewritten, {} MB", out.decal.name, out.changed_tiles, out.layer.bin.len() >> 20);
+            count += 1;
+            Ok(())
+        })
+        .unwrap();
+        println!("{count} decals in {:.2?}", started.elapsed());
+        assert!(count > 0);
     }
 }

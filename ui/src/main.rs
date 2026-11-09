@@ -108,6 +108,7 @@ struct App {
     map_check: Task<(String, egui::TextureHandle)>,
     geography_check: Task<String>,
     rng_check: Task<String>,
+    height_check: Task<(String, egui::TextureHandle)>,
     /// 中央的原版地圖（步驟 4），啟動時開始讀。
     vanilla: Task<(String, egui::TextureHandle)>,
 }
@@ -129,6 +130,7 @@ impl App {
             map_check: Task::Idle,
             geography_check: Task::Idle,
             rng_check: Task::Idle,
+            height_check: Task::Idle,
             vanilla,
         }
     }
@@ -155,7 +157,7 @@ impl App {
         self.map_check.button(ui, check_locations);
         self.map_check.show(ui, |ui, (summary, texture)| {
             ui.label(summary);
-            ui.add(egui::Image::new(texture).shrink_to_fit());
+            wide_image(ui, texture);
         });
         ui.add_space(12.0);
 
@@ -170,7 +172,7 @@ impl App {
         ui.strong("4. 在視窗中央顯示原版地圖");
         ui.weak("視窗啟動時就在背景讀取；結果在「產生器」頁中央，這裡也顯示一份。按「執行」重新讀。");
         self.vanilla.button(ui, vanilla_map);
-        self.vanilla.show(ui, show_map);
+        self.vanilla.show(ui, |ui, map| show_map(ui, map, wide_image));
         ui.add_space(12.0);
 
         ui.strong("5. 可重現的亂數");
@@ -183,6 +185,20 @@ impl App {
         self.rng_check.button(ui, move |_| Ok(check_rng(seed)));
         self.rng_check.show(ui, |ui, text| {
             ui.label(text);
+        });
+        ui.add_space(12.0);
+
+        ui.strong("6. 噪聲高度場");
+        ui.weak(format!(
+            "用目前的種子（{}）在新世界範圍內算分形噪聲，每 4 像素一格；白＝高、黑＝低，範圍外是深藍。\
+             換種子再按一次，圖案應該完全不同；同一個種子按兩次則完全相同。",
+            self.seed
+        ));
+        let seed = self.seed;
+        self.height_check.button(ui, move |ctx| height_map(ctx, seed));
+        self.height_check.show(ui, |ui, (summary, texture)| {
+            ui.label(summary);
+            wide_image(ui, texture);
         });
     }
 
@@ -242,7 +258,7 @@ impl eframe::App for App {
             .show(ui, |ui| self.settings(ui));
         egui::CentralPanel::default_margins().show(ui, |ui| {
             ui.weak("原版地圖（生成後會換成新地圖）");
-            self.vanilla.show(ui, show_map);
+            self.vanilla.show(ui, |ui, map| show_map(ui, map, fit_image));
         });
     }
 }
@@ -373,7 +389,11 @@ fn vanilla_map(ctx: &egui::Context) -> Outcome<(String, egui::TextureHandle)> {
 }
 
 /// 畫地圖、圖例與說明。
-fn show_map(ui: &mut egui::Ui, (summary, texture): &(String, egui::TextureHandle)) {
+fn show_map(
+    ui: &mut egui::Ui,
+    (summary, texture): &(String, egui::TextureHandle),
+    image: fn(&mut egui::Ui, &egui::TextureHandle),
+) {
     ui.horizontal_wrapped(|ui| {
         for (.., color, name) in LEGEND {
             let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
@@ -384,7 +404,72 @@ fn show_map(ui: &mut egui::Ui, (summary, texture): &(String, egui::TextureHandle
         }
     });
     ui.label(summary);
+    image(ui, texture);
+}
+
+/// 縮到剩下的寬和高都放得下（不能捲動的區域用）。
+fn fit_image(ui: &mut egui::Ui, texture: &egui::TextureHandle) {
     ui.add(egui::Image::new(texture).shrink_to_fit());
+}
+
+/// 只依寬度縮放（捲動區用）：捲動區給的可用高度是畫面剩下的高度，越下面越小，
+/// 用 `shrink_to_fit` 會把排在底部的圖縮到看不見。
+fn wide_image(ui: &mut egui::Ui, texture: &egui::TextureHandle) {
+    let width = ui.available_width();
+    let [w, h] = texture.size();
+    let size = egui::vec2(width, width * h as f32 / w as f32);
+    ui.add(egui::Image::new(texture).fit_to_exact_size(size));
+}
+
+/// 步驟 6：新世界範圍內的噪聲高度場，畫成灰階圖。
+fn height_map(ctx: &egui::Context, seed: u64) -> Outcome<(String, egui::TextureHandle)> {
+    use eu5_rnw_core::noise::{NoiseParams, height_field};
+
+    let map_data = eu5_rnw_core::game::choose_game(None).map_err(|e| e.to_string())?.map_data();
+    let map = read_location_map(&map_data).map_err(|e| e.to_string())?;
+    let geo = read_geography(&map_data, &map.locations).map_err(|e| e.to_string())?;
+    geo.unplaced(&map.locations, &map.pixel_counts())?;
+    let new_world = geo.new_world()?;
+
+    const STEP: usize = 4;
+    let (w, h, labels) = map.downsample(STEP);
+    let mask: Vec<bool> = labels.iter().map(|&l| new_world[usize::from(l)]).collect();
+    let params = NoiseParams::default();
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let start = Instant::now();
+    let field = height_field(seed, &params, (w, h, STEP), &mask, threads);
+    let seconds = start.elapsed().as_secs_f64();
+
+    let inside: Vec<f32> = mask.iter().zip(&field.values).filter(|(m, _)| **m).map(|(_, v)| *v).collect();
+    let (min, max) = inside.iter().fold((f32::MAX, f32::MIN), |(lo, hi), &v| (lo.min(v), hi.max(v)));
+    let mean = inside.iter().map(|&v| f64::from(v)).sum::<f64>() / inside.len().max(1) as f64;
+    let pixels: Vec<u8> = mask
+        .iter()
+        .zip(&field.values)
+        .flat_map(|(&m, &v)| {
+            if m {
+                // 用實際最低、最高拉開對比。
+                let g = ((v - min) / (max - min).max(f32::EPSILON) * 255.0) as u8;
+                [g, g, g]
+            } else {
+                [0x10, 0x1c, 0x2c]
+            }
+        })
+        .collect();
+    let summary = format!(
+        "種子 {seed}：{} 格（{w}×{h} 中的新世界），噪聲值 {min:.3}～{max:.3}，平均 {mean:.3}；\
+         特徵寬度 {} 像素、{} 層、persistence {}；{threads} 個執行緒算噪聲 {seconds:.2} 秒。",
+        inside.len(),
+        params.feature_px,
+        params.octaves,
+        params.persistence,
+    );
+    let options = egui::TextureOptions {
+        mipmap_mode: Some(egui::TextureFilter::Linear),
+        ..egui::TextureOptions::LINEAR
+    };
+    let image = egui::ColorImage::from_rgb([w, h], &pixels);
+    Ok((summary, ctx.load_texture("height", image, options)))
 }
 
 /// 每 `step` 像素取一點，用每個地點的顏色畫成縮圖。
@@ -393,13 +478,8 @@ fn preview(
     step: usize,
     colors: &[[u8; 3]],
 ) -> egui::ColorImage {
-    let (w, h) = (map.width / step, map.height / step);
-    let mut pixels = Vec::with_capacity(w * h * 3);
-    for y in 0..h {
-        for x in 0..w {
-            pixels.extend_from_slice(&colors[usize::from(map.label(x * step, y * step))]);
-        }
-    }
+    let (w, h, labels) = map.downsample(step);
+    let pixels: Vec<u8> = labels.iter().flat_map(|&l| colors[usize::from(l)]).collect();
     egui::ColorImage::from_rgb([w, h], &pixels)
 }
 

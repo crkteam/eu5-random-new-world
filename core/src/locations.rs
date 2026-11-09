@@ -89,6 +89,15 @@ impl LocationMap {
         self.labels[y * self.width + x]
     }
 
+    /// 每 `step` 像素取一點的縮小標籤圖：(寬, 高, 標籤)。
+    pub fn downsample(&self, step: usize) -> (usize, usize, Vec<Label>) {
+        let (w, h) = (self.width / step, self.height / step);
+        let labels = (0..h)
+            .flat_map(|y| (0..w).map(move |x| self.label(x * step, y * step)))
+            .collect();
+        (w, h, labels)
+    }
+
     /// 每個地點佔多少像素（索引同 `locations`）。
     pub fn pixel_counts(&self) -> Vec<u64> {
         let mut counts = vec![0u64; self.locations.len()];

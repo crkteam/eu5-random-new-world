@@ -4,6 +4,7 @@ pub mod error;
 pub mod game;
 pub mod geography;
 pub mod locations;
+pub mod noise;
 pub mod pdx;
 pub mod rng;
 pub mod vdf;
